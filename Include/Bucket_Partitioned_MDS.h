@@ -76,11 +76,6 @@ namespace Bucket_Partitioned_MDS
             const double, 
             std::vector <node_t>&) const;
 
-        void construct_mst(
-            const CVRP&, 
-            const std::vector <node_t>&, 
-            std::vector <std::vector <node_t>>&) const; 
-
         distance_t get_route_distance(
             const CVRP&, 
             const std::vector <node_t>&) const;

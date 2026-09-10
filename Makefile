@@ -18,7 +18,9 @@ COMMON_SRC = Src/Main.cpp \
              $(shell find Lib/Utils -name '*.cpp')
 
 GPU_SRC = Lib/Gpu/DeviceData.cu \
-          Lib/Gpu/BucketKernels.cu
+          Lib/Gpu/BucketKernels.cu \
+          Lib/Gpu/MstKernels.cu \
+          Lib/Gpu/SolverContext.cu
 
 COMMON_OBJ = $(COMMON_SRC:.cpp=.o)
 GPU_OBJ    = $(GPU_SRC:.cu=.o)

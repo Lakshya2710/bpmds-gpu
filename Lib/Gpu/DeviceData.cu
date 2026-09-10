@@ -1,5 +1,6 @@
 #include "Gpu/DeviceData.h"
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -67,6 +68,42 @@ namespace Gpu
         CUDA_CHECK(cudaMemcpy(d_sep_y_,  h_sep_y.data(),  (num_buckets_ + 1) * sizeof(double), cudaMemcpyHostToDevice));
     }
 
+    void DeviceCVRP::upload_bucket_layout(const BucketLayout& layout)
+    {
+        cudaFree(d_bucket_nodes_);
+        cudaFree(d_bucket_offsets_);
+        d_bucket_nodes_   = nullptr;
+        d_bucket_offsets_ = nullptr;
+
+        bucket_layout_size_ = static_cast<int>(layout.nodes.size());
+        max_bucket_size_    = 0;
+
+        for (int b = 0; b < layout.num_buckets; ++b)
+        {
+            const int k = layout.offsets[b + 1] - layout.offsets[b];
+            max_bucket_size_ = std::max(max_bucket_size_, k);
+        }
+
+        if (bucket_layout_size_ == 0)
+        {
+            return;
+        }
+
+        CUDA_CHECK(cudaMalloc(&d_bucket_nodes_,   bucket_layout_size_ * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_bucket_offsets_, (layout.num_buckets + 1) * sizeof(int)));
+
+        CUDA_CHECK(cudaMemcpy(
+            d_bucket_nodes_,
+            layout.nodes.data(),
+            bucket_layout_size_ * sizeof(int),
+            cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(
+            d_bucket_offsets_,
+            layout.offsets.data(),
+            (layout.num_buckets + 1) * sizeof(int),
+            cudaMemcpyHostToDevice));
+    }
+
     DeviceCVRP::~DeviceCVRP()
     {
         cudaFree(d_x_);
@@ -75,5 +112,7 @@ namespace Gpu
         cudaFree(d_sep_x_);
         cudaFree(d_sep_y_);
         cudaFree(d_bucket_id_);
+        cudaFree(d_bucket_nodes_);
+        cudaFree(d_bucket_offsets_);
     }
 }

@@ -37,16 +37,26 @@ namespace Gpu
         const double* device_sep_y() const { return d_sep_y_; }
         int*          device_bucket_id() { return d_bucket_id_; }
 
+        void upload_bucket_layout(const BucketLayout& layout);
+        const int*    device_bucket_nodes() const { return d_bucket_nodes_; }
+        const int*    device_bucket_offsets() const { return d_bucket_offsets_; }
+        int           bucket_layout_size() const { return bucket_layout_size_; }
+        int           max_bucket_size() const { return max_bucket_size_; }
+
     private:
         int     N_;
         int     num_buckets_;
         double  alpha_;
-        double* d_x_          = nullptr;
-        double* d_y_          = nullptr;
-        double* d_demand_     = nullptr;
-        double* d_sep_x_      = nullptr;
-        double* d_sep_y_      = nullptr;
-        int*    d_bucket_id_  = nullptr;
+        double* d_x_               = nullptr;
+        double* d_y_               = nullptr;
+        double* d_demand_          = nullptr;
+        double* d_sep_x_           = nullptr;
+        double* d_sep_y_           = nullptr;
+        int*    d_bucket_id_       = nullptr;
+        int*    d_bucket_nodes_    = nullptr;
+        int*    d_bucket_offsets_  = nullptr;
+        int     bucket_layout_size_ = 0;
+        int     max_bucket_size_    = 0;
     };
 
     BucketLayout assign_and_compact_buckets(DeviceCVRP& device);

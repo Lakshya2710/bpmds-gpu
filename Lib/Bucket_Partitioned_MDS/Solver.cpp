@@ -1,6 +1,6 @@
 #include "Utils.h"
 #include "Bucket_Partitioned_MDS.h"
-#include "Gpu/BucketPartition.h"
+#include "Gpu/SolverContext.h"
 #include <chrono>
 #include <stack>
 #include <random>
@@ -13,7 +13,8 @@ namespace Bucket_Partitioned_MDS
         const CVRP& cvrp, 
         std::vector <std::vector <node_t>>& buckets) const 
     {
-        Gpu::create_buckets(cvrp, alpha, buckets);
+        Gpu::SolverContext gpu_ctx(cvrp, alpha);
+        gpu_ctx.create_buckets(buckets);
     }
 
     void Solver::get_bucket(
@@ -49,63 +50,6 @@ namespace Bucket_Partitioned_MDS
             if(vec.is_in_between(start_vector, end_vector)) // check if vec is in [stat_vector, end_vector) region
             {
                 bucket.push_back(u); // push into bucket if present 
-            }
-        }
-
-        return;
-    }
-
-    void Solver::construct_mst(
-        const CVRP&                         cvrp,
-        const std::vector <node_t>&         bucket,
-        std::vector <std::vector <node_t>>& adj) const
-    {
-        /*
-        * construct_mst: Helper function to construct random MST on the nodes in bucket
-        * @param cvrp: CVRP instance which is currently considered to solve
-        * @param bucket: Nodes in bucket on which MST is to be constructed
-        * @param adj: Adjacency list of MST
-        * @return: Returns nothing
-        */
-
-        // Create min heap
-        const int num_nodes = bucket.size();
-        Min_Heap min_heap(num_nodes);
-
-        // Starting from depot
-        const node_t depot = 0;
-        const node_t depot_index = 0;
-        node_t u = depot;
-        node_t u_index = depot_index;             
-        min_heap.DecreaseKey(Min_Heap_Node(-1, depot_index, 0));    
-        Min_Heap_Node min_node = min_heap.pop(); 
-        node_t v;
-        node_t v_index;
-        for(v_index = 1; v_index < num_nodes; v_index++) 
-        {
-            min_heap.DecreaseKey(Min_Heap_Node(u_index, v_index, cvrp.distance(bucket[u_index], bucket[v_index]))); 
-        }
-
-        // Adding edges to MST 
-        while(!min_heap.empty()) 
-        { 
-            // Get the minimum weight edge 
-            min_node = min_heap.pop();
-            u_index = min_node.u; // Index of the node in the bucket
-            v_index = min_node.v; // Index of the neighbour of bucket[u_index]
-
-            // Add the edge to the graph (v_index is added to MST)
-            adj[u_index].push_back(v_index);                                
-            adj[v_index].push_back(u_index);       
-
-            // Get the corresponding vertex in entire CVRP space                                      
-            v = bucket[v_index];                                                       
-
-            // Loop over all neighbours of v_index 
-            for(node_t w_index = 0; w_index < num_nodes; w_index++) 
-            {
-                node_t w = bucket[w_index];
-                min_heap.DecreaseKey(Min_Heap_Node(v_index, w_index, cvrp.distance(v, w)));
             }
         }
 
@@ -527,10 +471,11 @@ namespace Bucket_Partitioned_MDS
         // Useful values for solving
         const int num_buckets = std::ceil(360.00 / alpha); 
         std::vector <std::vector<node_t>> buckets(num_buckets);
-        create_buckets(cvrp, buckets); 
 
-        // Paritioning the problem for exploitation
-        #pragma omp parallel for 
+        Gpu::SolverContext gpu_ctx(cvrp, alpha);
+        gpu_ctx.create_buckets(buckets);
+
+        // Partitioning the problem for exploitation (sequential bucket loop; GPU MST via shared context)
         for(int bucket_id = 0; bucket_id < num_buckets; bucket_id++) 
         {
             const std::vector <node_t>& bucket = buckets[bucket_id];
@@ -539,12 +484,11 @@ namespace Bucket_Partitioned_MDS
             std::vector <std::vector <node_t>> low_cost_routes;
             distance_t low_cost      = DBL_MAX;
 
-            // Get MST
-            std::vector <std::vector <node_t>> mst_adj(bucket.size());
-            construct_mst(cvrp, bucket, mst_adj);
+            // Get MST (GPU Boruvka)
+            std::vector <std::vector <node_t>> mst_adj;
+            gpu_ctx.construct_mst(bucket_id, mst_adj);
 
             // Exploitation: getting different routes from different DFS orders of MST
-            #pragma omp parallel for 
             for(int _ = 0; _ < rho; _++)
             {
                 // Finding random DFS order of the MST
@@ -552,28 +496,21 @@ namespace Bucket_Partitioned_MDS
                 distance_t cost = 0.0;
                 get_routes(cvrp, mst_adj, bucket, routes, cost);
 
-                #pragma omp critical 
-                { 
-                    // Updating the cost if lower cost routes are found
-                    if(low_cost > cost) 
-                    {
-                        low_cost_routes = routes;
-                        low_cost        = cost;
-                    }
+                if(low_cost > cost) 
+                {
+                    low_cost_routes = routes;
+                    low_cost        = cost;
                 }
             }
 
             if(!low_cost_routes.empty())
             {
                 process_routes(cvrp, low_cost_routes, low_cost);   
-                #pragma omp critical 
-                {
-                    for(auto& route: low_cost_routes) 
-                    { 
-                        final_routes.push_back(std::move(route)); 
-                    } 
-                    final_cost += low_cost;
-                }
+                for(auto& route: low_cost_routes) 
+                { 
+                    final_routes.push_back(std::move(route)); 
+                } 
+                final_cost += low_cost;
             }
         }
 

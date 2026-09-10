@@ -1,5 +1,6 @@
 #include "Gpu/DeviceData.h"
 #include "Gpu/BucketPartition.h"
+#include "Gpu/SolverContext.h"
 
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
@@ -213,25 +214,7 @@ namespace Gpu
         double                              alpha,
         std::vector<std::vector<node_t>>&   buckets)
     {
-        const int num_buckets = static_cast<int>(buckets.size());
-
-        for (auto& bucket : buckets)
-        {
-            bucket.clear();
-        }
-
-        DeviceCVRP device(cvrp, alpha);
-        BucketLayout layout = assign_and_compact_buckets(device);
-
-        for (int b = 0; b < num_buckets; ++b)
-        {
-            const int start = layout.offsets[b];
-            const int end   = layout.offsets[b + 1];
-            buckets[b].reserve(end - start);
-            for (int i = start; i < end; ++i)
-            {
-                buckets[b].push_back(layout.nodes[i]);
-            }
-        }
+        SolverContext ctx(cvrp, alpha);
+        ctx.create_buckets(buckets);
     }
 }
