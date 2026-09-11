@@ -13,7 +13,8 @@ namespace Gpu
 {
     /*
      * SolverContext: GPU session for one solve() call.
-     * Holds O(N) device data, bucket layout, and reusable MST scratch buffers.
+     * Step A: streamed Boruvka MST per bucket (no waves).
+     * Step B: streamed rho DFS trials per bucket (no waves).
      */
     class SolverContext
     {
@@ -25,7 +26,15 @@ namespace Gpu
         SolverContext& operator=(const SolverContext&) = delete;
 
         void create_buckets(std::vector<std::vector<node_t>>& buckets);
-        void construct_mst(int bucket_id, std::vector<std::vector<node_t>>& mst_adj);
+
+        void build_all_msts_streamed();
+        void run_all_route_trials_streamed(int rho);
+
+        void fetch_best_routes_for_bucket(
+            int                               bucket_id,
+            int                               rho,
+            std::vector<std::vector<node_t>>& routes,
+            double&                           cost);
 
         int num_buckets() const;
 

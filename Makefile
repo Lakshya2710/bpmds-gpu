@@ -2,8 +2,8 @@
 CXX  = g++
 NVCC = nvcc
 
-# Host C++ flags
-CXXFLAGS = -O3 -march=native -flto -std=c++17 -IInclude -static-libstdc++
+# Host C++ flags (no -flto: incompatible with nvcc final link on mixed toolchains)
+CXXFLAGS = -O3 -march=native -std=c++17 -IInclude -static-libstdc++
 
 # CUDA flags (override arch: make CUDA_ARCH=-arch=sm_80)
 CUDA_ARCH ?= -arch=native
@@ -20,6 +20,7 @@ COMMON_SRC = Src/Main.cpp \
 GPU_SRC = Lib/Gpu/DeviceData.cu \
           Lib/Gpu/BucketKernels.cu \
           Lib/Gpu/MstKernels.cu \
+          Lib/Gpu/RouteKernels.cu \
           Lib/Gpu/SolverContext.cu
 
 COMMON_OBJ = $(COMMON_SRC:.cpp=.o)
@@ -44,7 +45,7 @@ bench-marking: $(BENCH_TARGETS)
 
 $(TARGET): $(COMMON_OBJ) $(GPU_OBJ) Lib/Bucket_Partitioned_MDS/Solver.o
 	@mkdir -p Bin
-	$(CXX) $(CXXFLAGS) -flto $^ -o $@ -lcudart
+	$(NVCC) $(CUDAFLAGS) -o $@ $^ -Xcompiler="$(CXXFLAGS)" -Xcompiler=-pthread
 	@echo "Build successful: $@"
 
 %.o: %.cpp

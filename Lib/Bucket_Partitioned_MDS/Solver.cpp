@@ -475,41 +475,26 @@ namespace Bucket_Partitioned_MDS
         Gpu::SolverContext gpu_ctx(cvrp, alpha);
         gpu_ctx.create_buckets(buckets);
 
-        // Partitioning the problem for exploitation (sequential bucket loop; GPU MST via shared context)
-        for(int bucket_id = 0; bucket_id < num_buckets; bucket_id++) 
+        // Step A: all bucket MSTs on GPU via CUDA streams (no waves)
+        gpu_ctx.build_all_msts_streamed();
+
+        // Step B: all rho trials per bucket on GPU via CUDA streams (no waves)
+        gpu_ctx.run_all_route_trials_streamed(rho);
+
+        for (int bucket_id = 0; bucket_id < num_buckets; ++bucket_id)
         {
-            const std::vector <node_t>& bucket = buckets[bucket_id];
+            std::vector<std::vector<node_t>> low_cost_routes;
+            distance_t low_cost = DBL_MAX;
 
-            // Useful data structures for exploitation
-            std::vector <std::vector <node_t>> low_cost_routes;
-            distance_t low_cost      = DBL_MAX;
+            gpu_ctx.fetch_best_routes_for_bucket(bucket_id, rho, low_cost_routes, low_cost);
 
-            // Get MST (GPU Boruvka)
-            std::vector <std::vector <node_t>> mst_adj;
-            gpu_ctx.construct_mst(bucket_id, mst_adj);
-
-            // Exploitation: getting different routes from different DFS orders of MST
-            for(int _ = 0; _ < rho; _++)
+            if (!low_cost_routes.empty())
             {
-                // Finding random DFS order of the MST
-                std::vector <std::vector <node_t>> routes;
-                distance_t cost = 0.0;
-                get_routes(cvrp, mst_adj, bucket, routes, cost);
-
-                if(low_cost > cost) 
+                process_routes(cvrp, low_cost_routes, low_cost);
+                for (auto& route : low_cost_routes)
                 {
-                    low_cost_routes = routes;
-                    low_cost        = cost;
+                    final_routes.push_back(std::move(route));
                 }
-            }
-
-            if(!low_cost_routes.empty())
-            {
-                process_routes(cvrp, low_cost_routes, low_cost);   
-                for(auto& route: low_cost_routes) 
-                { 
-                    final_routes.push_back(std::move(route)); 
-                } 
                 final_cost += low_cost;
             }
         }
