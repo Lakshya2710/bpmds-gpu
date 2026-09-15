@@ -13,7 +13,6 @@ namespace Gpu
         int*    trial_num_routes = nullptr; // num_buckets * rho
         int*    route_offsets   = nullptr; // num_buckets * rho * (max_k + 1)
         int*    route_nodes     = nullptr; // num_buckets * rho * max_k (global node ids, concatenated)
-        int*    trial_scratch   = nullptr; // num_buckets * rho * scratch_stride
     };
 
     void allocate_route_trial_storage(RouteTrialStorage& storage, int num_buckets, int rho, int max_k);

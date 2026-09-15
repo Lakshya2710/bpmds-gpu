@@ -7,7 +7,7 @@ CXXFLAGS = -O3 -march=native -std=c++17 -IInclude -static-libstdc++
 
 # CUDA flags (override arch: make CUDA_ARCH=-arch=sm_80)
 CUDA_ARCH ?= -arch=native
-CUDAFLAGS = -O3 -std=c++17 $(CUDA_ARCH) -IInclude
+CUDAFLAGS = -O3 -std=c++17 $(CUDA_ARCH) -IInclude 
 
 # Shared sources
 COMMON_SRC = Src/Main.cpp \
@@ -83,3 +83,4 @@ clean:
 	@echo "Cleaned build artifacts"
 
 .PHONY: all bench-marking clean
+

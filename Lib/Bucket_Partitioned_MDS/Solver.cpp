@@ -474,28 +474,42 @@ namespace Bucket_Partitioned_MDS
 
         Gpu::SolverContext gpu_ctx(cvrp, alpha);
         gpu_ctx.create_buckets(buckets);
+	
+	auto end1 = std::chrono::high_resolution_clock::now();
+	std::cout<<"HERE1: "<<std::chrono::duration<double>(end1 - start).count()<<std::endl;
 
         // Step A: all bucket MSTs on GPU via CUDA streams (no waves)
         gpu_ctx.build_all_msts_streamed();
+	
+	auto end2 = std::chrono::high_resolution_clock::now();
+        std::cout<<"HERE2: "<<std::chrono::duration<double>(end2 - start).count()<<std::endl;
 
         // Step B: all rho trials per bucket on GPU via CUDA streams (no waves)
         gpu_ctx.run_all_route_trials_streamed(rho);
+	
+	auto end3 = std::chrono::high_resolution_clock::now();
+        std::cout<<"HERE3: "<<std::chrono::duration<double>(end3 - start).count()<<std::endl;
 
-        for (int bucket_id = 0; bucket_id < num_buckets; ++bucket_id)
+	for (int bucket_id = 0; bucket_id < num_buckets; ++bucket_id)
         {
             std::vector<std::vector<node_t>> low_cost_routes;
-            distance_t low_cost = DBL_MAX;
+            distance_t pre_opt_cost = DBL_MAX;
 
-            gpu_ctx.fetch_best_routes_for_bucket(bucket_id, rho, low_cost_routes, low_cost);
+            // Fetches routes that were ALREADY 2-Opt optimized by the GPU
+            gpu_ctx.fetch_best_routes_for_bucket(bucket_id, rho, low_cost_routes, pre_opt_cost);
 
             if (!low_cost_routes.empty())
             {
-                process_routes(cvrp, low_cost_routes, low_cost);
+                // REMOVED: process_routes(cvrp, low_cost_routes, low_cost); 
+
+                // Calculate the true cost of the GPU-perfected routes instantly
+                distance_t optimized_bucket_cost = 0.0;
                 for (auto& route : low_cost_routes)
                 {
+                    optimized_bucket_cost += get_route_distance(cvrp, route);
                     final_routes.push_back(std::move(route));
                 }
-                final_cost += low_cost;
+                final_cost += optimized_bucket_cost;
             }
         }
 

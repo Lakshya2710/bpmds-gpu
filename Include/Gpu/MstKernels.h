@@ -9,9 +9,8 @@ namespace Gpu
     struct MstBucketScratch
     {
         int*    parent          = nullptr;
-        double* cheapest_w      = nullptr;
-        int*    cheapest_u      = nullptr;
-        int*    cheapest_v      = nullptr;
+	unsigned long long* cheapest_edge = nullptr;
+	int* cheapest_v         = nullptr;
         int*    mst_u           = nullptr;
         int*    mst_v           = nullptr;
         int*    mst_edge_count  = nullptr;
@@ -55,9 +54,7 @@ namespace Gpu
         int                                 bucket_id,
         int                                 max_bucket_size,
         int*                                d_parent,
-        double*                             d_cheapest_w,
-        int*                                d_cheapest_u,
-        int*                                d_cheapest_v,
+	unsigned long long*                 d_cheapest_edge,
         int*                                d_mst_u,
         int*                                d_mst_v,
         int*                                d_mst_edge_count,
