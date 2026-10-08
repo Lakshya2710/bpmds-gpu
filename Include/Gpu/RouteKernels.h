@@ -16,12 +16,13 @@ namespace Gpu
         int*    num_routes    = nullptr; // num_buckets (winner only)
         int*    route_offsets = nullptr; // num_buckets * (max_k + 1) (winner only)
         int*    route_nodes   = nullptr; // num_buckets * max_k (winner only)
+        double* bx            = nullptr; // num_buckets * max_k, local-order x
+        double* by            = nullptr; // num_buckets * max_k, local-order y
+        double* bdemand       = nullptr; // num_buckets * max_k, local-order demand
     };
 
     void allocate_route_trial_storage(RouteTrialStorage& storage, int num_buckets, int rho, int max_k);
     void free_route_trial_storage(RouteTrialStorage& storage);
-
-    int route_trial_scratch_stride(int max_k);
 
     /*
      * One CUDA stream per bucket. All rho trials for a bucket run as threads

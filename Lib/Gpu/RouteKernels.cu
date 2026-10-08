@@ -1,5 +1,6 @@
 #include "Gpu/RouteKernels.h"
 
+#include <algorithm>
 #include <cmath>
 #include <vector>
 
@@ -20,16 +21,26 @@ namespace Gpu
             return static_cast<double>(sqrtf(dx * dx + dy * dy));
         }
 
+        __device__ inline double dist_local(
+            int           i,
+            int           j,
+            const double* bx,
+            const double* by)
+        {
+            const float dx = __double2float_rn(bx[i] - bx[j]);
+            const float dy = __double2float_rn(by[i] - by[j]);
+            return static_cast<double>(sqrtf(dx * dx + dy * dy));
+        }
+
         __device__ unsigned int lcg_next(unsigned int* state)
         {
             *state = (*state * 1103515245u + 12345u);
             return *state;
         }
 
-        // --- Streamlined Memory Accessors ---
-        // Down from 7 arrays to just 3!
-        __device__ int* visited(int* scratch, int k) { return scratch; }
-        __device__ int* stack_v(int* scratch, int k) { return scratch + k; }
+        // Cost-only: [stack_v | stack_parent] (2*k). Materialize adds curr_route (3*k).
+        __device__ int* stack_v(int* scratch, int k) { return scratch; }
+        __device__ int* stack_parent(int* scratch, int k) { return scratch + k; }
         __device__ int* curr_route(int* scratch, int k) { return scratch + 2 * k; }
 
         __device__ void get_routes_one_trial(
@@ -38,17 +49,17 @@ namespace Gpu
             int           k,
             const int*    row_offsets,
             const int*    cols,
-            const double* x,
-            const double* y,
-            const double* demand,
+            const double* bx,
+            const double* by,
+            const double* bdemand,
             double        capacity,
             int           bucket_id,
             int           trial_id,
             int*          scratch,
             double*       out_cost,
             int*          out_num_routes,
-            int*          out_route_offsets, 
-            int*          out_route_nodes)   
+            int*          out_route_offsets,
+            int*          out_route_nodes)
         {
             if (k <= 1)
             {
@@ -60,94 +71,97 @@ namespace Gpu
 
             unsigned int rng = static_cast<unsigned int>(bucket_id * 1000003 + trial_id * 9176u + 12345u);
 
-            for (int i = 0; i < k; ++i) visited(scratch, k)[i] = 0;
-
-            const int depot_global = bucket_nodes[bucket_offset];
-            double total_cost      = 0.0;
-            double residue         = capacity;
-            int    prev_global     = depot_global;
+            double total_cost  = 0.0;
+            double residue     = capacity;
+            int    prev_local  = 0;
 
             int out_node_write  = 0;
             int out_route_count = 0;
             if (out_route_offsets) out_route_offsets[0] = 0;
 
-            // MASSIVE SPEEDUP: These live in blazing fast hardware registers now!
             int top = 0;
             int route_len = 0;
 
-            // Push depot to start the tree walk
-            stack_v(scratch, k)[top++] = 0;
+            stack_v(scratch, k)[0]      = 0;
+            stack_parent(scratch, k)[0] = -1;
+            top = 1;
 
             while (top > 0)
             {
-                int u_idx = stack_v(scratch, k)[--top];
+                --top;
+                const int u_idx     = stack_v(scratch, k)[top];
+                const int parent_u  = stack_parent(scratch, k)[top];
 
-                if (visited(scratch, k)[u_idx]) continue;
-                visited(scratch, k)[u_idx] = 1;
-
-                // Process the node (skip payload math for the depot itself)
                 if (u_idx != 0)
                 {
-                    int u_global = bucket_nodes[bucket_offset + u_idx];
-                    double u_demand = demand[u_global];
+                    const double u_demand = bdemand[u_idx];
 
                     if (residue < u_demand)
                     {
-                        if (out_route_nodes) {
+                        if (out_route_nodes)
+                        {
                             for (int i = 0; i < route_len; ++i)
                                 out_route_nodes[out_node_write++] = curr_route(scratch, k)[i];
                             out_route_offsets[out_route_count + 1] = out_node_write;
                         }
                         route_len = 0;
-                        total_cost += dist_global(prev_global, depot_global, x, y);
+                        total_cost += dist_local(prev_local, 0, bx, by);
                         ++out_route_count;
-                        residue     = capacity;
-                        prev_global = depot_global;
+                        residue    = capacity;
+                        prev_local = 0;
                     }
 
-                    curr_route(scratch, k)[route_len++] = u_global;
-                    total_cost += dist_global(prev_global, u_global, x, y);
-                    residue -= u_demand;
-                    prev_global = u_global;
+                    if (out_route_nodes)
+                    {
+                        curr_route(scratch, k)[route_len] = bucket_nodes[bucket_offset + u_idx];
+                    }
+                    ++route_len;
+                    total_cost += dist_local(prev_local, u_idx, bx, by);
+                    residue    -= u_demand;
+                    prev_local  = u_idx;
                 }
 
-                // Push all unvisited neighbors directly to the stack
-                int start_top = top;
-                int row_start = row_offsets[u_idx];
-                int deg = row_offsets[u_idx + 1] - row_start;
+                const int start_top = top;
+                const int row_start = row_offsets[u_idx];
+                const int deg       = row_offsets[u_idx + 1] - row_start;
 
                 for (int i = 0; i < deg; ++i)
                 {
-                    int v_idx = cols[row_start + i];
-                    if (!visited(scratch, k)[v_idx])
+                    const int v_idx = cols[row_start + i];
+                    if (v_idx == parent_u)
                     {
-                        stack_v(scratch, k)[top++] = v_idx;
+                        continue;
                     }
+                    stack_v(scratch, k)[top]      = v_idx;
+                    stack_parent(scratch, k)[top] = u_idx;
+                    ++top;
                 }
 
-                // In-place shuffle of the newly pushed neighbors
-                int count = top - start_top;
+                const int count = top - start_top;
                 if (count > 1)
                 {
                     for (int i = count - 1; i > 0; --i)
                     {
-                        int j = lcg_next(&rng) % (i + 1);
+                        const int j = static_cast<int>(lcg_next(&rng) % static_cast<unsigned int>(i + 1));
                         int tmp = stack_v(scratch, k)[start_top + i];
                         stack_v(scratch, k)[start_top + i] = stack_v(scratch, k)[start_top + j];
                         stack_v(scratch, k)[start_top + j] = tmp;
+                        tmp = stack_parent(scratch, k)[start_top + i];
+                        stack_parent(scratch, k)[start_top + i] = stack_parent(scratch, k)[start_top + j];
+                        stack_parent(scratch, k)[start_top + j] = tmp;
                     }
                 }
             }
 
             if (route_len > 0)
             {
-                if (out_route_nodes) {
+                if (out_route_nodes)
+                {
                     for (int i = 0; i < route_len; ++i)
                         out_route_nodes[out_node_write++] = curr_route(scratch, k)[i];
                     out_route_offsets[out_route_count + 1] = out_node_write;
                 }
-                route_len = 0;
-                total_cost += dist_global(prev_global, depot_global, x, y);
+                total_cost += dist_local(prev_local, 0, bx, by);
                 ++out_route_count;
             }
 
@@ -256,30 +270,51 @@ namespace Gpu
 
         // =========================================================================
 
+        __global__ void pack_bucket_payload_kernel(
+            const int*    bucket_nodes,
+            int           bucket_offset,
+            int           k,
+            const double* x,
+            const double* y,
+            const double* demand,
+            double*       bx,
+            double*       by,
+            double*       bdemand)
+        {
+            const int i = blockIdx.x * blockDim.x + threadIdx.x;
+            if (i >= k) return;
+            const int g = bucket_nodes[bucket_offset + i];
+            bx[i]      = x[g];
+            by[i]      = y[g];
+            bdemand[i] = demand[g];
+        }
+
         __global__ void evaluate_routes_kernel(
             const int* bucket_nodes, int bucket_offset, int k,
-            const int* row_offsets, const int* cols, const double* x, const double* y,
-            const double* demand, double capacity, int bucket_id, int rho,
+            const int* row_offsets, const int* cols,
+            const double* bx, const double* by, const double* bdemand,
+            double capacity, int bucket_id, int rho,
             int scratch_stride, int* trial_scratch, double* trial_costs)
         {
             const int tid = blockIdx.x * blockDim.x + threadIdx.x;
-            int* scratch = trial_scratch + tid * scratch_stride; 
+            int* scratch = trial_scratch + tid * scratch_stride;
 
             for (int trial = tid; trial < rho; trial += gridDim.x * blockDim.x)
             {
                 double cost;
                 get_routes_one_trial(
-                    bucket_nodes, bucket_offset, k, row_offsets, cols, x, y, demand, capacity, 
-                    bucket_id, trial, scratch, &cost, nullptr, nullptr, nullptr); 
-                
+                    bucket_nodes, bucket_offset, k, row_offsets, cols, bx, by, bdemand, capacity,
+                    bucket_id, trial, scratch, &cost, nullptr, nullptr, nullptr);
+
                 trial_costs[bucket_id * rho + trial] = cost;
             }
         }
 
         __global__ void materialize_winner_kernel(
             const int* bucket_nodes, int bucket_offset, int k,
-            const int* row_offsets, const int* cols, const double* x, const double* y,
-            const double* demand, double capacity, int bucket_id, int rho,
+            const int* row_offsets, const int* cols,
+            const double* bx, const double* by, const double* bdemand,
+            double capacity, int bucket_id, int rho,
             int scratch_stride, int* trial_scratch, double* trial_costs,
             int* out_num_routes, int* out_route_offsets, int* out_route_nodes)
         {
@@ -295,12 +330,39 @@ namespace Gpu
                 }
             }
 
-            int* scratch = trial_scratch + 0 * scratch_stride;
+            int* scratch = trial_scratch;
             double dummy_cost;
 
             get_routes_one_trial(
-                bucket_nodes, bucket_offset, k, row_offsets, cols, x, y, demand, capacity, 
+                bucket_nodes, bucket_offset, k, row_offsets, cols, bx, by, bdemand, capacity,
                 bucket_id, best_trial, scratch, &dummy_cost, out_num_routes, out_route_offsets, out_route_nodes);
+        }
+
+        int choose_trial_blocks(int rho, int k, int num_buckets)
+        {
+            size_t free_bytes = 0;
+            size_t total_bytes = 0;
+            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+
+            size_t budget = free_bytes / 4;
+            if (num_buckets > 1)
+            {
+                budget /= static_cast<size_t>(num_buckets);
+            }
+
+            const size_t stack_bytes = static_cast<size_t>(2) * static_cast<size_t>(k) * sizeof(int);
+            size_t max_threads = stack_bytes == 0 ? 1 : budget / stack_bytes;
+            if (max_threads < static_cast<size_t>(kThreadsPerBlock))
+            {
+                max_threads = kThreadsPerBlock;
+            }
+
+            const int by_mem  = static_cast<int>(
+                std::min(max_threads, static_cast<size_t>(rho > 0 ? rho : 1)));
+            const int n       = std::max(1, std::min(rho, by_mem));
+            const int blocks  = (n + kThreadsPerBlock - 1) / kThreadsPerBlock;
+            const int max_blocks = std::max(1, static_cast<int>(max_threads / kThreadsPerBlock));
+            return std::max(1, std::min(blocks, max_blocks));
         }
 
         void launch_bucket_route_trials(
@@ -309,6 +371,7 @@ namespace Gpu
             int                     bucket_offset,
             int                     k,
             int                     max_k,
+            int                     num_buckets,
             const MstDeviceStorage& mst_storage,
             int                     rho,
             double                  capacity,
@@ -319,26 +382,37 @@ namespace Gpu
 
             const int* row_offsets = mst_storage.row_offsets + bucket_id * (max_k + 1);
             const int* cols        = mst_storage.cols + bucket_id * 2 * max_k;
+            double* bx      = storage.bx + bucket_id * max_k;
+            double* by      = storage.by + bucket_id * max_k;
+            double* bdemand = storage.bdemand + bucket_id * max_k;
 
-            int active_blocks = 4;
-            int active_threads = active_blocks * kThreadsPerBlock;
+            const int pack_blocks = (k + kThreadsPerBlock - 1) / kThreadsPerBlock;
+            pack_bucket_payload_kernel<<<pack_blocks, kThreadsPerBlock, 0, stream>>>(
+                device.device_bucket_nodes(), bucket_offset, k,
+                device.device_x(), device.device_y(), device.device_demand(),
+                bx, by, bdemand);
 
-            int stride = route_trial_scratch_stride(k);
-            size_t scratch_bytes = (size_t)active_threads * stride * sizeof(int);
+            const int active_blocks  = choose_trial_blocks(rho, k, num_buckets);
+            const int active_threads = active_blocks * kThreadsPerBlock;
+            const int eval_stride    = 2 * k;
+            const int mat_stride     = 3 * k;
+            const size_t scratch_ints = std::max(
+                static_cast<size_t>(active_threads) * static_cast<size_t>(eval_stride),
+                static_cast<size_t>(mat_stride));
             int* d_scratch;
-            CUDA_CHECK(cudaMallocAsync(&d_scratch, scratch_bytes, stream));
+            CUDA_CHECK(cudaMallocAsync(&d_scratch, scratch_ints * sizeof(int), stream));
 
             evaluate_routes_kernel<<<active_blocks, kThreadsPerBlock, 0, stream>>>(
                 device.device_bucket_nodes(), bucket_offset, k, row_offsets, cols,
-                device.device_x(), device.device_y(), device.device_demand(), capacity,
-                bucket_id, rho, stride, d_scratch, storage.trial_costs);
+                bx, by, bdemand, capacity,
+                bucket_id, rho, eval_stride, d_scratch, storage.trial_costs);
 
             materialize_winner_kernel<<<1, 1, 0, stream>>>(
                 device.device_bucket_nodes(), bucket_offset, k, row_offsets, cols,
-                device.device_x(), device.device_y(), device.device_demand(), capacity,
-                bucket_id, rho, stride, d_scratch, storage.trial_costs,
-                storage.num_routes + bucket_id, 
-                storage.route_offsets + bucket_id * (max_k + 1), 
+                bx, by, bdemand, capacity,
+                bucket_id, rho, mat_stride, d_scratch, storage.trial_costs,
+                storage.num_routes + bucket_id,
+                storage.route_offsets + bucket_id * (max_k + 1),
                 storage.route_nodes + bucket_id * max_k);
 
             int blocks = (k + kThreadsPerBlock - 1) / kThreadsPerBlock;
@@ -354,17 +428,15 @@ namespace Gpu
         }
     }
 
-    int route_trial_scratch_stride(int k)
-    {
-        return 3 * k; 
-    }
-
     void allocate_route_trial_storage(RouteTrialStorage& storage, int num_buckets, int rho, int max_k)
     {
         CUDA_CHECK(cudaMalloc(&storage.trial_costs, num_buckets * rho * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&storage.num_routes, num_buckets * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&storage.route_offsets, num_buckets * (max_k + 1) * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&storage.route_nodes, num_buckets * max_k * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&storage.bx, num_buckets * max_k * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&storage.by, num_buckets * max_k * sizeof(double)));
+        CUDA_CHECK(cudaMalloc(&storage.bdemand, num_buckets * max_k * sizeof(double)));
     }
 
     void free_route_trial_storage(RouteTrialStorage& storage)
@@ -373,6 +445,9 @@ namespace Gpu
         cudaFree(storage.num_routes);
         cudaFree(storage.route_offsets);
         cudaFree(storage.route_nodes);
+        cudaFree(storage.bx);
+        cudaFree(storage.by);
+        cudaFree(storage.bdemand);
         storage = {};
     }
 
@@ -393,7 +468,7 @@ namespace Gpu
             const int bucket_offset = h_offsets[bucket_id];
             const int k             = h_offsets[bucket_id + 1] - h_offsets[bucket_id];
             launch_bucket_route_trials(
-                device, bucket_id, bucket_offset, k, max_k, mst_storage, rho, capacity, storage, streams[bucket_id]);
+                device, bucket_id, bucket_offset, k, max_k, num_buckets, mst_storage, rho, capacity, storage, streams[bucket_id]);
         }
         for (int bucket_id = 0; bucket_id < num_buckets; ++bucket_id)
         {
