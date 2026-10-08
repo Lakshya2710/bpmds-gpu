@@ -7,12 +7,15 @@
 
 namespace Gpu
 {
+    /*
+     * Per-bucket trial costs plus the single winning route set (not rho copies).
+     */
     struct RouteTrialStorage
     {
-        double* trial_costs     = nullptr; // num_buckets * rho
-        int*    trial_num_routes = nullptr; // num_buckets * rho
-        int*    route_offsets   = nullptr; // num_buckets * rho * (max_k + 1)
-        int*    route_nodes     = nullptr; // num_buckets * rho * max_k (global node ids, concatenated)
+        double* trial_costs   = nullptr; // num_buckets * rho
+        int*    num_routes    = nullptr; // num_buckets (winner only)
+        int*    route_offsets = nullptr; // num_buckets * (max_k + 1) (winner only)
+        int*    route_nodes   = nullptr; // num_buckets * max_k (winner only)
     };
 
     void allocate_route_trial_storage(RouteTrialStorage& storage, int num_buckets, int rho, int max_k);
@@ -21,13 +24,12 @@ namespace Gpu
     int route_trial_scratch_stride(int max_k);
 
     /*
-     * Step B: one CUDA stream per bucket, all rho trials launched at once (no waves).
-     * Each thread runs one independent randomized DFS trial.
+     * One CUDA stream per bucket. All rho trials for a bucket run as threads
+     * inside one kernel on that bucket's stream.
      */
     void run_all_route_trials_on_streams(
         const DeviceCVRP&       device,
-        const int*              d_bucket_offsets,
-        const std::vector<int>& h_bucket_k,
+        const std::vector<int>& h_offsets,
         const MstDeviceStorage& mst_storage,
         int                     rho,
         int                     max_k,
@@ -35,9 +37,6 @@ namespace Gpu
         RouteTrialStorage&      storage,
         cudaStream_t*           streams);
 
-    /*
-     * Copy the lowest-cost trial for bucket_id back to host route vectors.
-     */
     void fetch_best_routes_from_device(
         int                               bucket_id,
         int                               rho,

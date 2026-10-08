@@ -68,39 +68,38 @@ namespace Gpu
         CUDA_CHECK(cudaMemcpy(d_sep_y_,  h_sep_y.data(),  (num_buckets_ + 1) * sizeof(double), cudaMemcpyHostToDevice));
     }
 
-    void DeviceCVRP::upload_bucket_layout(const BucketLayout& layout)
+    void DeviceCVRP::set_compacted_buckets(
+        const std::vector<int>& h_offsets,
+        const int*              nodes_src,
+        int                     n_nodes,
+        cudaMemcpyKind          nodes_kind)
     {
         cudaFree(d_bucket_nodes_);
         cudaFree(d_bucket_offsets_);
         d_bucket_nodes_   = nullptr;
         d_bucket_offsets_ = nullptr;
 
-        bucket_layout_size_ = static_cast<int>(layout.nodes.size());
+        bucket_layout_size_ = n_nodes;
         max_bucket_size_    = 0;
 
-        for (int b = 0; b < layout.num_buckets; ++b)
+        const int num_offsets = static_cast<int>(h_offsets.size());
+        for (int b = 0; b + 1 < num_offsets; ++b)
         {
-            const int k = layout.offsets[b + 1] - layout.offsets[b];
-            max_bucket_size_ = std::max(max_bucket_size_, k);
+            max_bucket_size_ = std::max(max_bucket_size_, h_offsets[b + 1] - h_offsets[b]);
         }
 
-        if (bucket_layout_size_ == 0)
+        if (n_nodes == 0 || num_offsets == 0)
         {
             return;
         }
 
-        CUDA_CHECK(cudaMalloc(&d_bucket_nodes_,   bucket_layout_size_ * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_bucket_offsets_, (layout.num_buckets + 1) * sizeof(int)));
-
-        CUDA_CHECK(cudaMemcpy(
-            d_bucket_nodes_,
-            layout.nodes.data(),
-            bucket_layout_size_ * sizeof(int),
-            cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&d_bucket_nodes_, n_nodes * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_bucket_offsets_, num_offsets * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_bucket_nodes_, nodes_src, n_nodes * sizeof(int), nodes_kind));
         CUDA_CHECK(cudaMemcpy(
             d_bucket_offsets_,
-            layout.offsets.data(),
-            (layout.num_buckets + 1) * sizeof(int),
+            h_offsets.data(),
+            num_offsets * sizeof(int),
             cudaMemcpyHostToDevice));
     }
 

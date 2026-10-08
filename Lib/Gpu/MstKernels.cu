@@ -1,6 +1,5 @@
 #include "Gpu/MstKernels.h"
 
-#include <cfloat>
 #include <algorithm>
 #include <thread>
 #include <vector>
@@ -192,10 +191,6 @@ namespace Gpu
             cols[row_offsets[v] + atomicAdd(&degrees[v], 1)] = u;
         }
 
-        __global__ void set_bucket_k_kernel(int* bucket_k, int bucket_id, int k) {
-            if (threadIdx.x == 0 && blockIdx.x == 0) bucket_k[bucket_id] = k;
-        }
-
         int launch_blocks(int n, int threads) { return (n + threads - 1) / threads; }
 
         void build_csr_from_edges(
@@ -238,17 +233,14 @@ namespace Gpu
     {
         CUDA_CHECK(cudaMalloc(&storage.row_offsets, num_buckets * (max_k + 1) * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&storage.cols, num_buckets * 2 * max_k * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&storage.bucket_k, num_buckets * sizeof(int)));
         CUDA_CHECK(cudaMemset(storage.row_offsets, 0, num_buckets * (max_k + 1) * sizeof(int)));
         CUDA_CHECK(cudaMemset(storage.cols, 0, num_buckets * 2 * max_k * sizeof(int)));
-        CUDA_CHECK(cudaMemset(storage.bucket_k, 0, num_buckets * sizeof(int)));
     }
 
     void free_mst_device_storage(MstDeviceStorage& storage)
     {
         cudaFree(storage.row_offsets);
         cudaFree(storage.cols);
-        cudaFree(storage.bucket_k);
         storage = {};
     }
 
@@ -264,8 +256,6 @@ namespace Gpu
     {
         int* row_offsets = storage.row_offsets + bucket_id * (max_k + 1);
         int* cols        = storage.cols + bucket_id * 2 * max_k;
-
-        set_bucket_k_kernel<<<1, 1, 0, stream>>>(storage.bucket_k, bucket_id, k);
 
         if (k <= 1) return;
         if (k == 2)
@@ -312,17 +302,13 @@ namespace Gpu
 
     void build_all_msts_on_streams(
         const DeviceCVRP&       device,
-        const int*              d_bucket_offsets,
-        const std::vector<int>& h_bucket_k,
+        const std::vector<int>& h_offsets,
         int                     max_k,
         MstBucketScratch*       per_bucket_scratch,
         MstDeviceStorage&       storage,
         cudaStream_t*           streams)
     {
-        const int num_buckets = static_cast<int>(h_bucket_k.size());
-        
-        std::vector<int> h_all_offsets(num_buckets + 1);
-        CUDA_CHECK(cudaMemcpy(h_all_offsets.data(), d_bucket_offsets, (num_buckets + 1) * sizeof(int), cudaMemcpyDeviceToHost));
+        const int num_buckets = static_cast<int>(h_offsets.size()) - 1;
 
         std::vector<std::thread> workers;
         workers.reserve(num_buckets);
@@ -331,87 +317,22 @@ namespace Gpu
         {
             workers.emplace_back([&, bucket_id]()
             {
-                const int bucket_offset = h_all_offsets[bucket_id];
-                const int k             = h_bucket_k[bucket_id];
+                const int bucket_offset = h_offsets[bucket_id];
+                const int k             = h_offsets[bucket_id + 1] - h_offsets[bucket_id];
 
-                construct_mst_boruvka_streamed(device, bucket_id, bucket_offset, k, max_k, per_bucket_scratch[bucket_id], storage, streams[bucket_id]);
+                construct_mst_boruvka_streamed(
+                    device,
+                    bucket_id,
+                    bucket_offset,
+                    k,
+                    max_k,
+                    per_bucket_scratch[bucket_id],
+                    storage,
+                    streams[bucket_id]);
                 CUDA_CHECK(cudaStreamSynchronize(streams[bucket_id]));
             });
         }
 
         for (auto& worker : workers) worker.join();
-    }
-
-    void construct_mst_boruvka(
-        const DeviceCVRP&                   device,
-        const int*                          d_bucket_nodes,
-        const int*                          d_bucket_offsets,
-        int                                 bucket_id,
-        int                                 max_bucket_size,
-        int*                                d_parent,
-        unsigned long long*                 d_cheapest_edge, 
-        int*                                d_cheapest_v, 
-        int*                                d_mst_u,
-        int*                                d_mst_v,
-        int*                                d_mst_edge_count,
-        int*                                d_component_count,
-        std::vector<std::vector<node_t>>&   mst_adj)
-    {
-        MstBucketScratch scratch;
-        scratch.parent          = d_parent;
-        scratch.cheapest_edge   = d_cheapest_edge;
-        scratch.cheapest_v      = d_cheapest_v;
-        scratch.mst_u           = d_mst_u;
-        scratch.mst_v           = d_mst_v;
-        scratch.mst_edge_count  = d_mst_edge_count;
-        scratch.component_count = d_component_count;
-
-        int h_offsets[2];
-        CUDA_CHECK(cudaMemcpy(h_offsets, d_bucket_offsets + bucket_id, 2 * sizeof(int), cudaMemcpyDeviceToHost));
-
-        const int bucket_offset = h_offsets[0];
-        const int k             = h_offsets[1] - h_offsets[0];
-
-        mst_adj.clear();
-        mst_adj.resize(k);
-
-        if (k <= 1) return;
-
-        cudaStream_t stream = nullptr;
-        CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-
-        MstDeviceStorage temp_storage;
-        allocate_mst_device_storage(temp_storage, 1, max_bucket_size);
-
-        construct_mst_boruvka_streamed(device, 0, bucket_offset, k, max_bucket_size, scratch, temp_storage, stream);
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-
-        if (k == 2)
-        {
-            mst_adj[0].push_back(1);
-            mst_adj[1].push_back(0);
-            free_mst_device_storage(temp_storage);
-            cudaStreamDestroy(stream);
-            return;
-        }
-
-        int edge_count = 0;
-        CUDA_CHECK(cudaMemcpy(&edge_count, d_mst_edge_count, sizeof(int), cudaMemcpyDeviceToHost));
-        edge_count = std::min(edge_count, k - 1);
-
-        std::vector<int> h_mst_u(edge_count), h_mst_v(edge_count);
-        CUDA_CHECK(cudaMemcpy(h_mst_u.data(), d_mst_u, edge_count * sizeof(int), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(h_mst_v.data(), d_mst_v, edge_count * sizeof(int), cudaMemcpyDeviceToHost));
-
-        for (int e = 0; e < edge_count; ++e)
-        {
-            const int u = h_mst_u[e], v = h_mst_v[e];
-            if (u < 0 || v < 0 || u >= k || v >= k) continue;
-            mst_adj[u].push_back(v);
-            mst_adj[v].push_back(u);
-        }
-
-        free_mst_device_storage(temp_storage);
-        cudaStreamDestroy(stream);
     }
 }

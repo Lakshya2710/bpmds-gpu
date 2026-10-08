@@ -70,47 +70,9 @@ namespace Bucket_Partitioned_MDS
         const double alpha;
         const int rho;
 
-        void get_bucket(
-            const CVRP&, 
-            const double, 
-            const double, 
-            std::vector <node_t>&) const;
-
         distance_t get_route_distance(
             const CVRP&, 
             const std::vector <node_t>&) const;
-
-        void tsp_approx(
-            const CVRP&, 
-            std::vector <node_t>&, 
-            std::vector <node_t>&, 
-            node_t) const;
-
-        std::vector<std::vector<node_t>> process_tsp_approx(
-            const CVRP&, 
-            const std::vector<std::vector<node_t>>&) const;
-
-        void tsp_2OPT(
-            const CVRP&, 
-            std::vector <node_t>&,
-            std::vector <node_t>&, 
-            int) const;
-        
-        std::vector<std::vector<node_t>> process_2OPT(
-            const CVRP&,
-            const std::vector<std::vector<node_t>>&) const;
-        
-        void process_routes(
-            const CVRP&, 
-            std::vector <std::vector<int>>&, 
-            distance_t&) const;
-
-        void get_routes(
-            const CVRP&, 
-            const std::vector <std::vector <node_t>>&, 
-            const std::vector <node_t>&, 
-            std::vector <std::vector <node_t>>&, 
-            distance_t&) const;
 
     public:
         Solver(
@@ -119,10 +81,6 @@ namespace Bucket_Partitioned_MDS
 
         Solution solve(
             const CVRP&) const;
-
-        void create_buckets(
-            const CVRP&,
-            std::vector <std::vector <node_t>>&) const;
     };
 }
 

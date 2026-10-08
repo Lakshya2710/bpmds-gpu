@@ -2,14 +2,32 @@
 CXX  = g++
 NVCC = nvcc
 
-# Host C++ flags (no -flto: incompatible with nvcc final link on mixed toolchains)
+# CUDA toolkit path (on clusters: module load cuda, then make CUDA_HOME=$CUDA_ROOT)
+CUDA_HOME ?= /usr/local/cuda
+ifeq ($(wildcard $(CUDA_HOME)/lib64/libcudart.so),)
+  ifeq ($(wildcard $(CUDA_HOME)/lib/libcudart.so),)
+    CUDA_LIB_DIR =
+  else
+    CUDA_LIB_DIR = $(CUDA_HOME)/lib
+  endif
+else
+  CUDA_LIB_DIR = $(CUDA_HOME)/lib64
+endif
+
+# Host C++ flags
 CXXFLAGS = -O3 -march=native -std=c++17 -IInclude -static-libstdc++
 
 # CUDA flags (override arch: make CUDA_ARCH=-arch=sm_80)
 CUDA_ARCH ?= -arch=native
-CUDAFLAGS = -O3 -std=c++17 $(CUDA_ARCH) -IInclude 
+CUDAFLAGS = -O3 -std=c++17 $(CUDA_ARCH) -IInclude
 
-# Shared sources
+# Link flags — explicit cudart path fixes "cannot find -lcudart" on PBS/cluster nodes
+ifneq ($(CUDA_LIB_DIR),)
+  CUDALINK = -L$(CUDA_LIB_DIR) -lcudart -Xcompiler=-pthread
+else
+  CUDALINK = -lcudart -Xcompiler=-pthread
+endif
+
 COMMON_SRC = Src/Main.cpp \
              Lib/Bucket_Partitioned_MDS/CVRP.cpp \
              Lib/Bucket_Partitioned_MDS/Solution.cpp \
@@ -26,26 +44,13 @@ GPU_SRC = Lib/Gpu/DeviceData.cu \
 COMMON_OBJ = $(COMMON_SRC:.cpp=.o)
 GPU_OBJ    = $(GPU_SRC:.cu=.o)
 
-# Main solver (default)
 TARGET = Bin/bucket-partitioned-MDS
 
-# Benchmarking / ablation binaries (CPU-only solvers, no CUDA)
-TARGET_SET = Bin/bucket-partitioned-MDS-set
-TARGET_DFS = Bin/bucket-partitioned-MDS-dfs
-TARGET_BFS = Bin/bucket-partitioned-MDS-bfs
-TARGET_BKT = Bin/bucket-partitioned-MDS-buckets
-
-BENCH_TARGETS = $(TARGET_SET) $(TARGET_DFS) $(TARGET_BFS) $(TARGET_BKT)
-
-# Default: main solver with CUDA
 all: $(TARGET)
-
-# All variants used for benchmarking (CPU-only)
-bench-marking: $(BENCH_TARGETS)
 
 $(TARGET): $(COMMON_OBJ) $(GPU_OBJ) Lib/Bucket_Partitioned_MDS/Solver.o
 	@mkdir -p Bin
-	$(NVCC) $(CUDAFLAGS) -o $@ $^ -Xcompiler="$(CXXFLAGS)" -Xcompiler=-pthread
+	$(NVCC) $(CUDAFLAGS) -o $@ $^ -Xcompiler="$(CXXFLAGS)" $(CUDALINK)
 	@echo "Build successful: $@"
 
 %.o: %.cpp
@@ -57,30 +62,9 @@ $(TARGET): $(COMMON_OBJ) $(GPU_OBJ) Lib/Bucket_Partitioned_MDS/Solver.o
 Lib/Bucket_Partitioned_MDS/Solver.o: Lib/Bucket_Partitioned_MDS/Solver.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(TARGET_SET): $(COMMON_SRC) Scripts/BenchmarkingCode/Solver_cpp_set.cpp
-	@mkdir -p Bin
-	$(CXX) $(CXXFLAGS) $^ -o $@
-	@echo "Build successful: $@"
-
-$(TARGET_DFS): $(COMMON_SRC) Scripts/BenchmarkingCode/Solver_Non_Lazy_DFS.cpp
-	@mkdir -p Bin
-	$(CXX) $(CXXFLAGS) $^ -o $@
-	@echo "Build successful: $@"
-
-$(TARGET_BFS): $(COMMON_SRC) Scripts/BenchmarkingCode/Solver_BFS.cpp
-	@mkdir -p Bin
-	$(CXX) $(CXXFLAGS) $^ -o $@
-	@echo "Build successful: $@"
-
-$(TARGET_BKT): $(COMMON_SRC) Scripts/BenchmarkingCode/Solver_buckets.cpp
-	@mkdir -p Bin
-	$(CXX) $(CXXFLAGS) $^ -o $@
-	@echo "Build successful: $@"
-
 clean:
 	rm -rf Bin/*
 	rm -f $(COMMON_OBJ) $(GPU_OBJ) Lib/Bucket_Partitioned_MDS/Solver.o
 	@echo "Cleaned build artifacts"
 
-.PHONY: all bench-marking clean
-
+.PHONY: all clean

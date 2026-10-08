@@ -3,22 +3,21 @@
 #include "Gpu/MstKernels.h"
 #include "Gpu/RouteKernels.h"
 
-#include <algorithm>
+#include <vector>
 
 namespace Gpu
 {
     struct SolverContext::Impl
     {
         DeviceCVRP          device;
-        BucketLayout        layout;
         int                 max_bucket_size = 0;
         int                 num_buckets     = 0;
-        double              capacity      = 0.0;
-        std::vector<int>    h_bucket_k;
+        double              capacity        = 0.0;
+        std::vector<int>    h_offsets;
 
-        MstDeviceStorage*        mst_storage         = nullptr;
-        MstBucketScratch*        per_bucket_scratch  = nullptr;
-        cudaStream_t*            streams             = nullptr;
+        MstDeviceStorage             mst_storage;
+        std::vector<MstBucketScratch> per_bucket_scratch;
+        std::vector<cudaStream_t>     streams;
 
         RouteTrialStorage route_storage;
         int               route_rho = 0;
@@ -31,7 +30,7 @@ namespace Gpu
 
         void allocate_streams()
         {
-            streams = new cudaStream_t[num_buckets];
+            streams.resize(num_buckets);
             for (int b = 0; b < num_buckets; ++b)
             {
                 CUDA_CHECK(cudaStreamCreateWithFlags(&streams[b], cudaStreamNonBlocking));
@@ -40,24 +39,18 @@ namespace Gpu
 
         void free_streams()
         {
-            if (streams == nullptr)
+            for (cudaStream_t stream : streams)
             {
-                return;
+                cudaStreamDestroy(stream);
             }
-            for (int b = 0; b < num_buckets; ++b)
-            {
-                cudaStreamDestroy(streams[b]);
-            }
-            delete[] streams;
-            streams = nullptr;
+            streams.clear();
         }
 
         void allocate_mst_resources()
         {
-            mst_storage = new MstDeviceStorage;
-            allocate_mst_device_storage(*mst_storage, num_buckets, max_bucket_size);
+            allocate_mst_device_storage(mst_storage, num_buckets, max_bucket_size);
 
-            per_bucket_scratch = new MstBucketScratch[num_buckets];
+            per_bucket_scratch.assign(num_buckets, MstBucketScratch{});
             for (int b = 0; b < num_buckets; ++b)
             {
                 allocate_mst_bucket_scratch(per_bucket_scratch[b], max_bucket_size);
@@ -66,21 +59,12 @@ namespace Gpu
 
         void free_mst_resources()
         {
-            if (per_bucket_scratch != nullptr)
+            for (MstBucketScratch& scratch : per_bucket_scratch)
             {
-                for (int b = 0; b < num_buckets; ++b)
-                {
-                    free_mst_bucket_scratch(per_bucket_scratch[b]);
-                }
-                delete[] per_bucket_scratch;
-                per_bucket_scratch = nullptr;
+                free_mst_bucket_scratch(scratch);
             }
-            if (mst_storage != nullptr)
-            {
-                free_mst_device_storage(*mst_storage);
-                delete mst_storage;
-                mst_storage = nullptr;
-            }
+            per_bucket_scratch.clear();
+            free_mst_device_storage(mst_storage);
         }
 
         ~Impl()
@@ -105,53 +89,27 @@ namespace Gpu
         return impl_->num_buckets;
     }
 
-    void SolverContext::create_buckets(std::vector<std::vector<node_t>>& buckets)
+    void SolverContext::partition()
     {
-        const int num_buckets = static_cast<int>(buckets.size());
-
-        for (auto& bucket : buckets)
-        {
-            bucket.clear();
-        }
-
-        impl_->layout = assign_and_compact_buckets(impl_->device);
-        impl_->device.upload_bucket_layout(impl_->layout);
+        impl_->h_offsets       = compact_buckets(impl_->device);
         impl_->max_bucket_size = impl_->device.max_bucket_size();
-        impl_->num_buckets     = num_buckets;
-
-        impl_->h_bucket_k.resize(num_buckets);
-        for (int b = 0; b < num_buckets; ++b)
-        {
-            impl_->h_bucket_k[b] = impl_->layout.offsets[b + 1] - impl_->layout.offsets[b];
-        }
+        impl_->num_buckets     = impl_->device.num_buckets();
 
         impl_->free_mst_resources();
         impl_->free_streams();
         impl_->allocate_streams();
         impl_->allocate_mst_resources();
-
-        for (int b = 0; b < num_buckets; ++b)
-        {
-            const int start = impl_->layout.offsets[b];
-            const int end   = impl_->layout.offsets[b + 1];
-            buckets[b].reserve(end - start);
-            for (int i = start; i < end; ++i)
-            {
-                buckets[b].push_back(impl_->layout.nodes[i]);
-            }
-        }
     }
 
     void SolverContext::build_all_msts_streamed()
     {
         build_all_msts_on_streams(
             impl_->device,
-            impl_->device.device_bucket_offsets(),
-            impl_->h_bucket_k,
+            impl_->h_offsets,
             impl_->max_bucket_size,
-            impl_->per_bucket_scratch,
-            *impl_->mst_storage,
-            impl_->streams);
+            impl_->per_bucket_scratch.data(),
+            impl_->mst_storage,
+            impl_->streams.data());
     }
 
     void SolverContext::run_all_route_trials_streamed(int rho)
@@ -174,14 +132,13 @@ namespace Gpu
 
         run_all_route_trials_on_streams(
             impl_->device,
-            impl_->device.device_bucket_offsets(),
-            impl_->h_bucket_k,
-            *impl_->mst_storage,
+            impl_->h_offsets,
+            impl_->mst_storage,
             rho,
             impl_->max_bucket_size,
             impl_->capacity,
             impl_->route_storage,
-            impl_->streams);
+            impl_->streams.data());
     }
 
     void SolverContext::fetch_best_routes_for_bucket(

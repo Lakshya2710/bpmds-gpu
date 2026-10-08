@@ -12,9 +12,9 @@ namespace Bucket_Partitioned_MDS
 namespace Gpu
 {
     /*
-     * SolverContext: GPU session for one solve() call.
-     * Step A: streamed Boruvka MST per bucket (no waves).
-     * Step B: streamed rho DFS trials per bucket (no waves).
+     * GPU session for one solve() call.
+     * Keeps one CUDA stream and one MstBucketScratch per bucket so MST and
+     * rho work can overlap across buckets.
      */
     class SolverContext
     {
@@ -25,7 +25,7 @@ namespace Gpu
         SolverContext(const SolverContext&)            = delete;
         SolverContext& operator=(const SolverContext&) = delete;
 
-        void create_buckets(std::vector<std::vector<node_t>>& buckets);
+        void partition();
 
         void build_all_msts_streamed();
         void run_all_route_trials_streamed(int rho);

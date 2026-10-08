@@ -6,16 +6,11 @@
 
 namespace Gpu
 {
-    struct BucketLayout
-    {
-        std::vector<node_t> nodes;
-        std::vector<int>    offsets;
-        int                 num_buckets;
-    };
-
     /*
      * DeviceCVRP: O(N) GPU resident problem data (coordinates + demands).
      * Separating vectors are O(num_buckets) and also live on device.
+     * After compact_buckets(), d_bucket_nodes_ / d_bucket_offsets_ are the
+     * source of truth for which global nodes sit in each angular bucket.
      */
     class DeviceCVRP
     {
@@ -37,27 +32,36 @@ namespace Gpu
         const double* device_sep_y() const { return d_sep_y_; }
         int*          device_bucket_id() { return d_bucket_id_; }
 
-        void upload_bucket_layout(const BucketLayout& layout);
+        void set_compacted_buckets(
+            const std::vector<int>& h_offsets,
+            const int*              nodes_src,
+            int                     n_nodes,
+            cudaMemcpyKind          nodes_kind);
+
         const int*    device_bucket_nodes() const { return d_bucket_nodes_; }
         const int*    device_bucket_offsets() const { return d_bucket_offsets_; }
-        int           bucket_layout_size() const { return bucket_layout_size_; }
         int           max_bucket_size() const { return max_bucket_size_; }
 
     private:
         int     N_;
         int     num_buckets_;
         double  alpha_;
-        double* d_x_               = nullptr;
-        double* d_y_               = nullptr;
-        double* d_demand_          = nullptr;
-        double* d_sep_x_           = nullptr;
-        double* d_sep_y_           = nullptr;
-        int*    d_bucket_id_       = nullptr;
-        int*    d_bucket_nodes_    = nullptr;
-        int*    d_bucket_offsets_  = nullptr;
+        double* d_x_                = nullptr;
+        double* d_y_                = nullptr;
+        double* d_demand_           = nullptr;
+        double* d_sep_x_            = nullptr;
+        double* d_sep_y_            = nullptr;
+        int*    d_bucket_id_        = nullptr;
+        int*    d_bucket_nodes_     = nullptr;
+        int*    d_bucket_offsets_   = nullptr;
         int     bucket_layout_size_ = 0;
         int     max_bucket_size_    = 0;
     };
 
-    BucketLayout assign_and_compact_buckets(DeviceCVRP& device);
+    /*
+     * Assign customers to angular buckets, sort them into a flat node list on
+     * the GPU, and install d_bucket_nodes_ / d_bucket_offsets_.
+     * Returns host offsets of length num_buckets+1 (k[b] = offsets[b+1]-offsets[b]).
+     */
+    std::vector<int> compact_buckets(DeviceCVRP& device);
 }

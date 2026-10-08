@@ -6,22 +6,30 @@
 
 namespace Gpu
 {
+    /*
+     * Temporary Boruvka workspace for one in-flight bucket MST.
+     * Parallel MSTs need one copy per concurrent bucket (size B with B streams).
+     */
     struct MstBucketScratch
     {
-        int*    parent          = nullptr;
-	unsigned long long* cheapest_edge = nullptr;
-	int* cheapest_v         = nullptr;
-        int*    mst_u           = nullptr;
-        int*    mst_v           = nullptr;
-        int*    mst_edge_count  = nullptr;
-        int*    component_count = nullptr;
+        int*                parent          = nullptr;
+        unsigned long long* cheapest_edge   = nullptr;
+        int*                cheapest_v      = nullptr;
+        int*                mst_u           = nullptr;
+        int*                mst_v           = nullptr;
+        int*                mst_edge_count  = nullptr;
+        int*                component_count = nullptr;
     };
 
+    /*
+     * Final per-bucket MST in padded CSR.
+     * Bucket b uses row_offsets[b * (max_k+1) ...] and cols[b * 2 * max_k ...].
+     * Only the first k+1 offsets and 2*(k-1) cols are valid for that bucket.
+     */
     struct MstDeviceStorage
     {
-        int* row_offsets = nullptr; // num_buckets * (max_k + 1), padded CSR rows
-        int* cols        = nullptr; // num_buckets * 2 * max_k, padded CSR cols
-        int* bucket_k    = nullptr; // num_buckets actual sizes
+        int* row_offsets = nullptr;
+        int* cols        = nullptr;
     };
 
     void allocate_mst_bucket_scratch(MstBucketScratch& scratch, int max_k);
@@ -30,10 +38,6 @@ namespace Gpu
     void allocate_mst_device_storage(MstDeviceStorage& storage, int num_buckets, int max_k);
     void free_mst_device_storage(MstDeviceStorage& storage);
 
-    /*
-     * Build Boruvka MST for one bucket on a CUDA stream.
-     * Writes CSR into storage row_offsets/cols at bucket_id slice.
-     */
     void construct_mst_boruvka_streamed(
         const DeviceCVRP&     device,
         int                   bucket_id,
@@ -45,31 +49,14 @@ namespace Gpu
         cudaStream_t          stream);
 
     /*
-     * Legacy host adjacency output (kept for compatibility).
-     */
-    void construct_mst_boruvka(
-        const DeviceCVRP&                   device,
-        const int*                          d_bucket_nodes,
-        const int*                          d_bucket_offsets,
-        int                                 bucket_id,
-        int                                 max_bucket_size,
-        int*                                d_parent,
-	unsigned long long*                 d_cheapest_edge,
-        int*                                d_mst_u,
-        int*                                d_mst_v,
-        int*                                d_mst_edge_count,
-        int*                                d_component_count,
-        std::vector<std::vector<node_t>>&   mst_adj);
-
-    /*
-     * Step A: one CUDA stream per bucket, all MSTs built concurrently (no waves).
+     * One CUDA stream per bucket. Host threads keep each bucket's Boruvka
+     * while-loop feeding its own stream so MSTs overlap.
      */
     void build_all_msts_on_streams(
-        const DeviceCVRP&     device,
-        const int*            d_bucket_offsets,
-        const std::vector<int>& h_bucket_k,
-        int                   max_k,
-        MstBucketScratch*     per_bucket_scratch,
-        MstDeviceStorage&     storage,
-        cudaStream_t*         streams);
+        const DeviceCVRP&       device,
+        const std::vector<int>& h_offsets,
+        int                     max_k,
+        MstBucketScratch*       per_bucket_scratch,
+        MstDeviceStorage&       storage,
+        cudaStream_t*           streams);
 }

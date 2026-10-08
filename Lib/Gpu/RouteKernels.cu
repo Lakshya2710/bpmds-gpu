@@ -1,9 +1,6 @@
 #include "Gpu/RouteKernels.h"
 
-#include <cfloat>
 #include <cmath>
-#include <algorithm>
-#include <thread>
 #include <vector>
 
 namespace Gpu
@@ -39,7 +36,6 @@ namespace Gpu
             const int*    bucket_nodes,
             int           bucket_offset,
             int           k,
-            int           max_k,
             const int*    row_offsets,
             const int*    cols,
             const double* x,
@@ -261,7 +257,7 @@ namespace Gpu
         // =========================================================================
 
         __global__ void evaluate_routes_kernel(
-            const int* bucket_nodes, int bucket_offset, int k, int max_k,
+            const int* bucket_nodes, int bucket_offset, int k,
             const int* row_offsets, const int* cols, const double* x, const double* y,
             const double* demand, double capacity, int bucket_id, int rho,
             int scratch_stride, int* trial_scratch, double* trial_costs)
@@ -273,7 +269,7 @@ namespace Gpu
             {
                 double cost;
                 get_routes_one_trial(
-                    bucket_nodes, bucket_offset, k, max_k, row_offsets, cols, x, y, demand, capacity, 
+                    bucket_nodes, bucket_offset, k, row_offsets, cols, x, y, demand, capacity, 
                     bucket_id, trial, scratch, &cost, nullptr, nullptr, nullptr); 
                 
                 trial_costs[bucket_id * rho + trial] = cost;
@@ -281,7 +277,7 @@ namespace Gpu
         }
 
         __global__ void materialize_winner_kernel(
-            const int* bucket_nodes, int bucket_offset, int k, int max_k,
+            const int* bucket_nodes, int bucket_offset, int k,
             const int* row_offsets, const int* cols, const double* x, const double* y,
             const double* demand, double capacity, int bucket_id, int rho,
             int scratch_stride, int* trial_scratch, double* trial_costs,
@@ -303,7 +299,7 @@ namespace Gpu
             double dummy_cost;
 
             get_routes_one_trial(
-                bucket_nodes, bucket_offset, k, max_k, row_offsets, cols, x, y, demand, capacity, 
+                bucket_nodes, bucket_offset, k, row_offsets, cols, x, y, demand, capacity, 
                 bucket_id, best_trial, scratch, &dummy_cost, out_num_routes, out_route_offsets, out_route_nodes);
         }
 
@@ -333,22 +329,22 @@ namespace Gpu
             CUDA_CHECK(cudaMallocAsync(&d_scratch, scratch_bytes, stream));
 
             evaluate_routes_kernel<<<active_blocks, kThreadsPerBlock, 0, stream>>>(
-                device.device_bucket_nodes(), bucket_offset, k, max_k, row_offsets, cols,
+                device.device_bucket_nodes(), bucket_offset, k, row_offsets, cols,
                 device.device_x(), device.device_y(), device.device_demand(), capacity,
                 bucket_id, rho, stride, d_scratch, storage.trial_costs);
 
             materialize_winner_kernel<<<1, 1, 0, stream>>>(
-                device.device_bucket_nodes(), bucket_offset, k, max_k, row_offsets, cols,
+                device.device_bucket_nodes(), bucket_offset, k, row_offsets, cols,
                 device.device_x(), device.device_y(), device.device_demand(), capacity,
                 bucket_id, rho, stride, d_scratch, storage.trial_costs,
-                storage.trial_num_routes + bucket_id, 
+                storage.num_routes + bucket_id, 
                 storage.route_offsets + bucket_id * (max_k + 1), 
                 storage.route_nodes + bucket_id * max_k);
 
             int blocks = (k + kThreadsPerBlock - 1) / kThreadsPerBlock;
             batched_postprocess_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
                 device.device_bucket_nodes(), bucket_offset,
-                storage.trial_num_routes + bucket_id,
+                storage.num_routes + bucket_id,
                 storage.route_offsets + bucket_id * (max_k + 1),
                 storage.route_nodes + bucket_id * max_k,
                 d_scratch, device.device_x(), device.device_y()
@@ -366,7 +362,7 @@ namespace Gpu
     void allocate_route_trial_storage(RouteTrialStorage& storage, int num_buckets, int rho, int max_k)
     {
         CUDA_CHECK(cudaMalloc(&storage.trial_costs, num_buckets * rho * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&storage.trial_num_routes, num_buckets * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&storage.num_routes, num_buckets * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&storage.route_offsets, num_buckets * (max_k + 1) * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&storage.route_nodes, num_buckets * max_k * sizeof(int)));
     }
@@ -374,7 +370,7 @@ namespace Gpu
     void free_route_trial_storage(RouteTrialStorage& storage)
     {
         cudaFree(storage.trial_costs);
-        cudaFree(storage.trial_num_routes);
+        cudaFree(storage.num_routes);
         cudaFree(storage.route_offsets);
         cudaFree(storage.route_nodes);
         storage = {};
@@ -382,8 +378,7 @@ namespace Gpu
 
     void run_all_route_trials_on_streams(
         const DeviceCVRP&       device,
-        const int*              d_bucket_offsets,
-        const std::vector<int>& h_bucket_k,
+        const std::vector<int>& h_offsets,
         const MstDeviceStorage& mst_storage,
         int                     rho,
         int                     max_k,
@@ -391,14 +386,12 @@ namespace Gpu
         RouteTrialStorage&      storage,
         cudaStream_t*           streams)
     {
-        const int num_buckets = static_cast<int>(h_bucket_k.size());
-        std::vector<int> h_offsets(num_buckets + 1);
-        CUDA_CHECK(cudaMemcpy(h_offsets.data(), d_bucket_offsets, (num_buckets + 1) * sizeof(int), cudaMemcpyDeviceToHost));
+        const int num_buckets = static_cast<int>(h_offsets.size()) - 1;
 
         for (int bucket_id = 0; bucket_id < num_buckets; ++bucket_id)
         {
             const int bucket_offset = h_offsets[bucket_id];
-            const int k             = h_bucket_k[bucket_id];
+            const int k             = h_offsets[bucket_id + 1] - h_offsets[bucket_id];
             launch_bucket_route_trials(
                 device, bucket_id, bucket_offset, k, max_k, mst_storage, rho, capacity, storage, streams[bucket_id]);
         }
@@ -420,7 +413,7 @@ namespace Gpu
         cost = 0.0;
 
         int num_routes = 0;
-        CUDA_CHECK(cudaMemcpy(&num_routes, storage.trial_num_routes + bucket_id, sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(&num_routes, storage.num_routes + bucket_id, sizeof(int), cudaMemcpyDeviceToHost));
 
         if (num_routes <= 0) return;
 

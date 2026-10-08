@@ -1,6 +1,4 @@
 #include "Gpu/DeviceData.h"
-#include "Gpu/BucketPartition.h"
-#include "Gpu/SolverContext.h"
 
 #include <thrust/device_vector.h>
 #include <thrust/sort.h>
@@ -17,7 +15,7 @@ namespace Gpu
         }
 
         /*
-         * Matches Unit_Vector_2D::is_in_between — true if (px,py) lies in [v1, v2).
+         * True if (px,py) lies in the half-open angular wedge [v1, v2).
          * All inputs are unit vectors in the depot-centered polar partition.
          */
         __device__ bool is_in_between(
@@ -144,25 +142,23 @@ namespace Gpu
         }
     }
 
-    BucketLayout assign_and_compact_buckets(DeviceCVRP& device)
+    std::vector<int> compact_buckets(DeviceCVRP& device)
     {
         const int N           = device.size();
         const int num_buckets = device.num_buckets();
-
-        BucketLayout layout;
-        layout.num_buckets = num_buckets;
-        layout.offsets.resize(num_buckets + 1);
+        std::vector<int> h_offsets(num_buckets + 1);
 
         if (num_buckets == 1)
         {
-            layout.nodes.resize(N);
+            std::vector<int> h_nodes(N);
             for (int u = 0; u < N; ++u)
             {
-                layout.nodes[u] = u;
+                h_nodes[u] = u;
             }
-            layout.offsets[0] = 0;
-            layout.offsets[1] = N;
-            return layout;
+            h_offsets[0] = 0;
+            h_offsets[1] = N;
+            device.set_compacted_buckets(h_offsets, h_nodes.data(), N, cudaMemcpyHostToDevice);
+            return h_offsets;
         }
 
         launch_assign_buckets(device);
@@ -187,34 +183,23 @@ namespace Gpu
         thrust::sort_by_key(d_keys.begin(), d_keys.end(), d_nodes.begin());
 
         std::vector<int> h_keys(total);
-        std::vector<int> h_nodes(total);
         CUDA_CHECK(cudaMemcpy(
             h_keys.data(),
             thrust::raw_pointer_cast(d_keys.data()),
             total * sizeof(int),
             cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(
-            h_nodes.data(),
-            thrust::raw_pointer_cast(d_nodes.data()),
-            total * sizeof(int),
-            cudaMemcpyDeviceToHost));
 
         for (int b = 0; b <= num_buckets; ++b)
         {
-            layout.offsets[b] = static_cast<int>(
+            h_offsets[b] = static_cast<int>(
                 std::lower_bound(h_keys.begin(), h_keys.end(), b) - h_keys.begin());
         }
 
-        layout.nodes.assign(h_nodes.begin(), h_nodes.end());
-        return layout;
-    }
-
-    void create_buckets(
-        const Bucket_Partitioned_MDS::CVRP& cvrp,
-        double                              alpha,
-        std::vector<std::vector<node_t>>&   buckets)
-    {
-        SolverContext ctx(cvrp, alpha);
-        ctx.create_buckets(buckets);
+        device.set_compacted_buckets(
+            h_offsets,
+            thrust::raw_pointer_cast(d_nodes.data()),
+            total,
+            cudaMemcpyDeviceToDevice);
+        return h_offsets;
     }
 }
