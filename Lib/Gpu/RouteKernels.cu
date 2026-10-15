@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
+#include <numeric>
 #include <vector>
 
 namespace Gpu
@@ -204,24 +206,37 @@ namespace Gpu
             }
         }
 
-        __device__ void gpu_tsp_2opt(int* tour, int sz, int depot, const double* x, const double* y, int* aux) {
+        __device__ void reverse_tour_segment(int* tour, int i, int k) {
+            while (i < k) {
+                const int tmp = tour[i];
+                tour[i] = tour[k];
+                tour[k] = tmp;
+                ++i;
+                --k;
+            }
+        }
+
+        /*
+         * Same first-improvement 2-opt as before: nested (i, k), accept as soon as
+         * the tour is shorter, keep scanning the updated tour, two idle passes to stop.
+         * Length change is four edges (depot if i==0 or k==sz-1); reverse only on accept.
+         */
+        __device__ void gpu_tsp_2opt(int* tour, int sz, int depot, const double* x, const double* y) {
             int improve = 0;
             while (improve < 2) {
-                double best_dist = calc_tour_cost(tour, sz, depot, x, y);
                 bool found = false;
-
                 for (int i = 0; i < sz - 1; ++i) {
                     for (int k = i + 1; k < sz; ++k) {
-                        for (int c = 0; c < i; ++c) aux[c] = tour[c];
-                        int dec = 0;
-                        for (int c = i; c <= k; ++c) aux[c] = tour[k - (dec++)];
-                        for (int c = k + 1; c < sz; ++c) aux[c] = tour[c];
-
-                        double new_dist = calc_tour_cost(aux, sz, depot, x, y);
-                        if (new_dist < best_dist) {
+                        const int a = (i == 0) ? depot : tour[i - 1];
+                        const int b = tour[i];
+                        const int c = tour[k];
+                        const int d = (k == sz - 1) ? depot : tour[k + 1];
+                        const double delta =
+                            dist_global(a, c, x, y) + dist_global(b, d, x, y)
+                          - dist_global(a, b, x, y) - dist_global(c, d, x, y);
+                        if (delta < 0.0) {
+                            reverse_tour_segment(tour, i, k);
                             improve = 0;
-                            for (int j = 0; j < sz; ++j) tour[j] = aux[j];
-                            best_dist = new_dist;
                             found = true;
                         }
                     }
@@ -249,14 +264,13 @@ namespace Gpu
             int* orig  = route_nodes + start;
             int* tour1 = flat_scratch + (start * 3);
             int* tour2 = flat_scratch + (start * 3) + sz;
-            int* aux   = flat_scratch + (start * 3) + 2 * sz;
 
             for(int i=0; i<sz; ++i) tour2[i] = orig[i];
-            gpu_tsp_2opt(tour2, sz, depot, x, y, aux);
+            gpu_tsp_2opt(tour2, sz, depot, x, y);
             double cost2 = calc_tour_cost(tour2, sz, depot, x, y);
 
             gpu_tsp_approx(orig, tour1, sz, depot, x, y);
-            gpu_tsp_2opt(tour1, sz, depot, x, y, aux);
+            gpu_tsp_2opt(tour1, sz, depot, x, y);
             double cost1 = calc_tour_cost(tour1, sz, depot, x, y);
 
             double orig_cost = calc_tour_cost(orig, sz, depot, x, y);
@@ -338,31 +352,41 @@ namespace Gpu
                 bucket_id, best_trial, scratch, &dummy_cost, out_num_routes, out_route_offsets, out_route_nodes);
         }
 
-        int choose_trial_blocks(int rho, int k, int num_buckets)
+        constexpr int kMaxTrialThreads = 2048;
+
+        int choose_trial_blocks(int rho)
         {
-            size_t free_bytes = 0;
-            size_t total_bytes = 0;
-            CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+            const int n = std::max(1, std::min(rho, kMaxTrialThreads));
+            return (n + kThreadsPerBlock - 1) / kThreadsPerBlock;
+        }
 
-            size_t budget = free_bytes / 4;
-            if (num_buckets > 1)
-            {
-                budget /= static_cast<size_t>(num_buckets);
-            }
+        struct BucketPhaseEvents
+        {
+            cudaEvent_t t0   = nullptr;
+            cudaEvent_t pack = nullptr;
+            cudaEvent_t eval = nullptr;
+            cudaEvent_t mat  = nullptr;
+            cudaEvent_t opt  = nullptr;
+            bool        used = false;
+        };
 
-            const size_t stack_bytes = static_cast<size_t>(2) * static_cast<size_t>(k) * sizeof(int);
-            size_t max_threads = stack_bytes == 0 ? 1 : budget / stack_bytes;
-            if (max_threads < static_cast<size_t>(kThreadsPerBlock))
-            {
-                max_threads = kThreadsPerBlock;
-            }
+        void create_phase_events(BucketPhaseEvents& ev)
+        {
+            CUDA_CHECK(cudaEventCreate(&ev.t0));
+            CUDA_CHECK(cudaEventCreate(&ev.pack));
+            CUDA_CHECK(cudaEventCreate(&ev.eval));
+            CUDA_CHECK(cudaEventCreate(&ev.mat));
+            CUDA_CHECK(cudaEventCreate(&ev.opt));
+        }
 
-            const int by_mem  = static_cast<int>(
-                std::min(max_threads, static_cast<size_t>(rho > 0 ? rho : 1)));
-            const int n       = std::max(1, std::min(rho, by_mem));
-            const int blocks  = (n + kThreadsPerBlock - 1) / kThreadsPerBlock;
-            const int max_blocks = std::max(1, static_cast<int>(max_threads / kThreadsPerBlock));
-            return std::max(1, std::min(blocks, max_blocks));
+        void destroy_phase_events(BucketPhaseEvents& ev)
+        {
+            if (ev.t0) cudaEventDestroy(ev.t0);
+            if (ev.pack) cudaEventDestroy(ev.pack);
+            if (ev.eval) cudaEventDestroy(ev.eval);
+            if (ev.mat) cudaEventDestroy(ev.mat);
+            if (ev.opt) cudaEventDestroy(ev.opt);
+            ev = {};
         }
 
         void launch_bucket_route_trials(
@@ -371,12 +395,12 @@ namespace Gpu
             int                     bucket_offset,
             int                     k,
             int                     max_k,
-            int                     num_buckets,
             const MstDeviceStorage& mst_storage,
             int                     rho,
             double                  capacity,
             RouteTrialStorage&      storage,
-            cudaStream_t            stream)
+            cudaStream_t            stream,
+            BucketPhaseEvents&      ev)
         {
             if (k <= 1) return;
 
@@ -386,13 +410,17 @@ namespace Gpu
             double* by      = storage.by + bucket_id * max_k;
             double* bdemand = storage.bdemand + bucket_id * max_k;
 
+            ev.used = true;
+            CUDA_CHECK(cudaEventRecord(ev.t0, stream));
+
             const int pack_blocks = (k + kThreadsPerBlock - 1) / kThreadsPerBlock;
             pack_bucket_payload_kernel<<<pack_blocks, kThreadsPerBlock, 0, stream>>>(
                 device.device_bucket_nodes(), bucket_offset, k,
                 device.device_x(), device.device_y(), device.device_demand(),
                 bx, by, bdemand);
+            CUDA_CHECK(cudaEventRecord(ev.pack, stream));
 
-            const int active_blocks  = choose_trial_blocks(rho, k, num_buckets);
+            const int active_blocks  = choose_trial_blocks(rho);
             const int active_threads = active_blocks * kThreadsPerBlock;
             const int eval_stride    = 2 * k;
             const int mat_stride     = 3 * k;
@@ -406,6 +434,7 @@ namespace Gpu
                 device.device_bucket_nodes(), bucket_offset, k, row_offsets, cols,
                 bx, by, bdemand, capacity,
                 bucket_id, rho, eval_stride, d_scratch, storage.trial_costs);
+            CUDA_CHECK(cudaEventRecord(ev.eval, stream));
 
             materialize_winner_kernel<<<1, 1, 0, stream>>>(
                 device.device_bucket_nodes(), bucket_offset, k, row_offsets, cols,
@@ -414,6 +443,7 @@ namespace Gpu
                 storage.num_routes + bucket_id,
                 storage.route_offsets + bucket_id * (max_k + 1),
                 storage.route_nodes + bucket_id * max_k);
+            CUDA_CHECK(cudaEventRecord(ev.mat, stream));
 
             int blocks = (k + kThreadsPerBlock - 1) / kThreadsPerBlock;
             batched_postprocess_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
@@ -423,6 +453,7 @@ namespace Gpu
                 storage.route_nodes + bucket_id * max_k,
                 d_scratch, device.device_x(), device.device_y()
             );
+            CUDA_CHECK(cudaEventRecord(ev.opt, stream));
 
             CUDA_CHECK(cudaFreeAsync(d_scratch, stream));
         }
@@ -463,16 +494,67 @@ namespace Gpu
     {
         const int num_buckets = static_cast<int>(h_offsets.size()) - 1;
 
-        for (int bucket_id = 0; bucket_id < num_buckets; ++bucket_id)
+        std::vector<int> order(num_buckets);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int a, int b) {
+            const int ka = h_offsets[a + 1] - h_offsets[a];
+            const int kb = h_offsets[b + 1] - h_offsets[b];
+            return ka > kb;
+        });
+
+        std::vector<BucketPhaseEvents> events(num_buckets);
+        for (int b = 0; b < num_buckets; ++b)
+        {
+            create_phase_events(events[b]);
+        }
+
+        for (int bucket_id : order)
         {
             const int bucket_offset = h_offsets[bucket_id];
             const int k             = h_offsets[bucket_id + 1] - h_offsets[bucket_id];
             launch_bucket_route_trials(
-                device, bucket_id, bucket_offset, k, max_k, num_buckets, mst_storage, rho, capacity, storage, streams[bucket_id]);
+                device, bucket_id, bucket_offset, k, max_k, mst_storage, rho, capacity,
+                storage, streams[bucket_id], events[bucket_id]);
         }
         for (int bucket_id = 0; bucket_id < num_buckets; ++bucket_id)
         {
             CUDA_CHECK(cudaStreamSynchronize(streams[bucket_id]));
+        }
+
+        float sum_pack = 0.0f, sum_eval = 0.0f, sum_mat = 0.0f, sum_opt = 0.0f;
+        for (int bucket_id = 0; bucket_id < num_buckets; ++bucket_id)
+        {
+            const int k = h_offsets[bucket_id + 1] - h_offsets[bucket_id];
+            float ms_pack = 0.0f, ms_eval = 0.0f, ms_mat = 0.0f, ms_opt = 0.0f;
+            if (events[bucket_id].used)
+            {
+                CUDA_CHECK(cudaEventElapsedTime(&ms_pack, events[bucket_id].t0, events[bucket_id].pack));
+                CUDA_CHECK(cudaEventElapsedTime(&ms_eval, events[bucket_id].pack, events[bucket_id].eval));
+                CUDA_CHECK(cudaEventElapsedTime(&ms_mat, events[bucket_id].eval, events[bucket_id].mat));
+                CUDA_CHECK(cudaEventElapsedTime(&ms_opt, events[bucket_id].mat, events[bucket_id].opt));
+            }
+            sum_pack += ms_pack;
+            sum_eval += ms_eval;
+            sum_mat += ms_mat;
+            sum_opt += ms_opt;
+            std::cout << "bucket " << bucket_id
+                      << " k=" << k
+                      << " pack_ms=" << ms_pack
+                      << " eval_ms=" << ms_eval
+                      << " mat_ms=" << ms_mat
+                      << " 2opt_ms=" << ms_opt
+                      << std::endl;
+        }
+        std::cout << "phase_sum_ms pack=" << sum_pack
+                  << " eval=" << sum_eval
+                  << " mat=" << sum_mat
+                  << " 2opt=" << sum_opt
+                  << " (sums can exceed wall clock because streams overlap)"
+                  << std::endl;
+
+        for (int b = 0; b < num_buckets; ++b)
+        {
+            destroy_phase_events(events[b]);
         }
     }
 

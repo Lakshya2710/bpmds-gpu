@@ -25,8 +25,7 @@ namespace Gpu
     void free_route_trial_storage(RouteTrialStorage& storage);
 
     /*
-     * One CUDA stream per bucket. All rho trials for a bucket run as threads
-     * inside one kernel on that bucket's stream.
+     * One CUDA stream per bucket. Each bucket launches min(rho, 2048) threads.
      */
     void run_all_route_trials_on_streams(
         const DeviceCVRP&       device,
