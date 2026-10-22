@@ -25,6 +25,9 @@ namespace Bucket_Partitioned_MDS
     public:
         CVRP(
             std::istream&);
+        CVRP(
+            capacity_t,
+            std::vector<Point>);
         distance_t distance(
             const node_t, 
             const node_t) const;
@@ -58,6 +61,8 @@ namespace Bucket_Partitioned_MDS
             const CVRP&) const;
         void print(
             std::ostream&) const;
+        const std::vector<std::vector<node_t>>& get_routes() const;
+        double solving_time() const;
     };
 
     class Solver 

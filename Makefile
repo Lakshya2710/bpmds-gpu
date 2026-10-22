@@ -1,33 +1,14 @@
-# Compiler (override on macOS: make CXX=g++-15)
 CXX  = g++
 NVCC = nvcc
 
-# CUDA toolkit path (on clusters: module load cuda, then make CUDA_HOME=$CUDA_ROOT)
-CUDA_HOME ?= /usr/local/cuda
-ifeq ($(wildcard $(CUDA_HOME)/lib64/libcudart.so),)
-  ifeq ($(wildcard $(CUDA_HOME)/lib/libcudart.so),)
-    CUDA_LIB_DIR =
-  else
-    CUDA_LIB_DIR = $(CUDA_HOME)/lib
-  endif
-else
-  CUDA_LIB_DIR = $(CUDA_HOME)/lib64
-endif
-
-# Host C++ flags
+# Host C++ flags (no -flto: incompatible with nvcc final link on mixed toolchains)
 CXXFLAGS = -O3 -march=native -std=c++17 -IInclude -static-libstdc++
 
 # CUDA flags (override arch: make CUDA_ARCH=-arch=sm_80)
 CUDA_ARCH ?= -arch=native
-CUDAFLAGS = -O3 -std=c++17 $(CUDA_ARCH) -IInclude
+CUDAFLAGS = -O3 -std=c++17 $(CUDA_ARCH) -IInclude 
 
-# Link flags — explicit cudart path fixes "cannot find -lcudart" on PBS/cluster nodes
-ifneq ($(CUDA_LIB_DIR),)
-  CUDALINK = -L$(CUDA_LIB_DIR) -lcudart -Xcompiler=-pthread
-else
-  CUDALINK = -lcudart -Xcompiler=-pthread
-endif
-
+# Shared sources
 COMMON_SRC = Src/Main.cpp \
              Lib/Bucket_Partitioned_MDS/CVRP.cpp \
              Lib/Bucket_Partitioned_MDS/Solution.cpp \
@@ -44,13 +25,33 @@ GPU_SRC = Lib/Gpu/DeviceData.cu \
 COMMON_OBJ = $(COMMON_SRC:.cpp=.o)
 GPU_OBJ    = $(GPU_SRC:.cu=.o)
 
+# Main solver (default)
 TARGET = Bin/bucket-partitioned-MDS
 
-all: $(TARGET)
+# Dynamic CVRP: pool rebuild with the same GPU solver
+DYNAMIC_TARGET = Bin/dynamic-bpmds
+UTIL_SRC = $(shell find Lib/Utils -name '*.cpp')
+UTIL_OBJ = $(UTIL_SRC:.cpp=.o)
+DYNAMIC_OBJ = Src/DynamicMain.o \
+              Lib/Bucket_Partitioned_MDS/Dynamic.o \
+              Lib/Gpu/NearestKernels.o
+
+# Default: main solver with CUDA
+all: $(TARGET) $(DYNAMIC_TARGET)
 
 $(TARGET): $(COMMON_OBJ) $(GPU_OBJ) Lib/Bucket_Partitioned_MDS/Solver.o
 	@mkdir -p Bin
-	$(NVCC) $(CUDAFLAGS) -o $@ $^ -Xcompiler="$(CXXFLAGS)" $(CUDALINK)
+	$(NVCC) $(CUDAFLAGS) -o $@ $^ -Xcompiler="$(CXXFLAGS)" -Xcompiler=-pthread
+	@echo "Build successful: $@"
+
+$(DYNAMIC_TARGET): $(DYNAMIC_OBJ) \
+                   Lib/Bucket_Partitioned_MDS/CVRP.o \
+                   Lib/Bucket_Partitioned_MDS/Solution.o \
+                   Lib/Bucket_Partitioned_MDS/Solver.o \
+                   $(GPU_OBJ) \
+                   $(UTIL_OBJ)
+	@mkdir -p Bin
+	$(NVCC) $(CUDAFLAGS) -o $@ $^ -Xcompiler="$(CXXFLAGS)" -Xcompiler=-pthread
 	@echo "Build successful: $@"
 
 %.o: %.cpp
@@ -64,7 +65,7 @@ Lib/Bucket_Partitioned_MDS/Solver.o: Lib/Bucket_Partitioned_MDS/Solver.cpp
 
 clean:
 	rm -rf Bin/*
-	rm -f $(COMMON_OBJ) $(GPU_OBJ) Lib/Bucket_Partitioned_MDS/Solver.o
+	rm -f $(COMMON_OBJ) $(GPU_OBJ) $(DYNAMIC_OBJ) Lib/Bucket_Partitioned_MDS/Solver.o
 	@echo "Cleaned build artifacts"
 
 .PHONY: all clean

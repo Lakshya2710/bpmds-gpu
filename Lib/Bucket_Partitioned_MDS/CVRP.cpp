@@ -68,6 +68,20 @@ namespace Bucket_Partitioned_MDS
             node[i].demand = stof(dStr);
         }
     }
+
+    CVRP::CVRP(
+        capacity_t capacity,
+        std::vector<Point> nodes)
+        : _capacity(capacity)
+        , _size(static_cast<int>(nodes.size()))
+        , node(std::move(nodes))
+        , type("EUC_2D")
+    {
+        if (_size <= 0)
+        {
+            HANDLE_ERROR("CVRP must contain at least the depot", true);
+        }
+    }
     
     distance_t CVRP::distance(
         const node_t u, 

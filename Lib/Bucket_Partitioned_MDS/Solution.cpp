@@ -76,6 +76,16 @@ namespace Bucket_Partitioned_MDS
         return true;
     }
 
+    const std::vector<std::vector<node_t>>& Solution::get_routes() const
+    {
+        return routes;
+    }
+
+    double Solution::solving_time() const
+    {
+        return time_for_solving;
+    }
+
     void Solution::print(
         std::ostream& output) const 
     {
