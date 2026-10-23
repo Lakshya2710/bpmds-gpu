@@ -34,7 +34,8 @@ UTIL_SRC = $(shell find Lib/Utils -name '*.cpp')
 UTIL_OBJ = $(UTIL_SRC:.cpp=.o)
 DYNAMIC_OBJ = Src/DynamicMain.o \
               Lib/Bucket_Partitioned_MDS/Dynamic.o \
-              Lib/Gpu/NearestKernels.o
+              Lib/Gpu/NearestKernels.o \
+              Lib/Gpu/InterRouteMoves.o
 
 # Default: main solver with CUDA
 all: $(TARGET) $(DYNAMIC_TARGET)

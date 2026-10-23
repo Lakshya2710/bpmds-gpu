@@ -1,5 +1,6 @@
 #include "Dynamic.h"
 #include "Bucket_Partitioned_MDS.h"
+#include "Gpu/InterRouteMoves.h"
 #include "Gpu/NearestKernels.h"
 
 #include <algorithm>
@@ -582,6 +583,9 @@ namespace Bucket_Partitioned_MDS
 
         std::vector<std::vector<node_t>> final_routes = std::move(kept_routes);
         double solve_seconds = 0.0;
+        double move_seconds = 0.0;
+        int move1_applied = 0;
+        int move8_applied = 0;
         const int pool_customers = static_cast<int>(pool_nodes.size()) - 1;
         if (pool_customers > 0)
         {
@@ -590,15 +594,29 @@ namespace Bucket_Partitioned_MDS
             const Solution pool_solution = solver.solve(pool);
             solve_seconds = pool_solution.solving_time();
 
+            std::vector<std::vector<int>> pool_routes;
             for (const std::vector<node_t>& local_route : pool_solution.get_routes())
             {
-                std::vector<node_t> real_route;
+                std::vector<int> real_route;
                 real_route.reserve(local_route.size());
                 for (node_t local : local_route)
                 {
                     real_route.push_back(local_to_real[local]);
                 }
-                final_routes.push_back(std::move(real_route));
+                pool_routes.push_back(std::move(real_route));
+            }
+
+            if (!pool_routes.empty())
+            {
+                Gpu::InterRouteStats move_stats;
+                Gpu::improve_pool_routes(pool_routes, updated.nodes, updated.capacity, move_stats);
+                move_seconds = move_stats.seconds;
+                move1_applied = move_stats.move1;
+                move8_applied = move_stats.move8;
+            }
+            for (auto& route : pool_routes)
+            {
+                final_routes.push_back(std::move(route));
             }
         }
 
@@ -634,6 +652,9 @@ namespace Bucket_Partitioned_MDS
         std::cerr << "Event time (s):   " << event_seconds << "\n";
         std::cerr << "Neighbour time (s): " << neighbour_seconds << "\n";
         std::cerr << "BPMDS time (s):   " << solve_seconds << "\n";
+        std::cerr << "Move time (s):    " << move_seconds << "\n";
+        std::cerr << "Move 1 applied:   " << move1_applied << "\n";
+        std::cerr << "Move 8 applied:   " << move8_applied << "\n";
         std::cerr << "Total time (s):   " << total_seconds << "\n";
         std::cerr << "Exact cost:       " << exact_cost << "\n";
         std::cerr << "Rounded cost:     " << reported_cost << "\n";
