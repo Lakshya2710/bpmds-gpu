@@ -56,54 +56,70 @@ namespace Gpu
                 return;
             }
 
+            // Force arrays into registers by initializing them with fixed bounds
             double best_dist[kMaxNeighbours];
             int best_id[kMaxNeighbours];
-            int filled = 0;
-            int farthest = 0;
-            const double qx = x[query];
-            const double qy = y[query];
-            const int qroute = route_of[query];
+
+            #pragma unroll
+            for (int i = 0; i < kMaxNeighbours; ++i)
+            {
+                best_dist[i] = 1e30; // Infinity removes the need for a 'filled' tracker
+                best_id[i] = -1;
+            }
+
+            // Wrap reads in __ldg() to use the instant L1 Texture Cache
+            const double qx = __ldg(&x[query]);
+            const double qy = __ldg(&y[query]);
+            const int qroute = __ldg(&route_of[query]);
 
             for (int s = 0; s < n; ++s)
             {
-                if (s == query || route_of[s] == qroute)
+                if (s == query)
                 {
                     continue;
                 }
-                const double dx = x[s] - qx;
-                const double dy = y[s] - qy;
+                
+                const int sroute = __ldg(&route_of[s]);
+                if (sroute == qroute)
+                {
+                    continue;
+                }
+                
+                const double dx = __ldg(&x[s]) - qx;
+                const double dy = __ldg(&y[s]) - qy;
                 const double dist2 = dx * dx + dy * dy;
 
-                if (filled < k)
+                // Only engage the update logic if it beats our worst tracked neighbor
+                if (dist2 < best_dist[k - 1])
                 {
-                    best_dist[filled] = dist2;
-                    best_id[filled] = s;
-                    if (dist2 > best_dist[farthest])
+                    double current_dist = dist2;
+                    int current_id = s;
+                    
+                    // A fully unrolled "Bubble Down" insertion sort
+                    // This strictly forces the arrays to remain in registers.
+                    #pragma unroll
+                    for (int i = 0; i < kMaxNeighbours; ++i)
                     {
-                        farthest = filled;
-                    }
-                    ++filled;
-                    continue;
-                }
-                if (dist2 >= best_dist[farthest])
-                {
-                    continue;
-                }
-                best_dist[farthest] = dist2;
-                best_id[farthest] = s;
-                farthest = 0;
-                for (int t = 1; t < k; ++t)
-                {
-                    if (best_dist[t] > best_dist[farthest])
-                    {
-                        farthest = t;
+                        if (i >= k) break; 
+                        
+                        if (current_dist < best_dist[i])
+                        {
+                            double tmp_dist = best_dist[i];
+                            int tmp_id = best_id[i];
+                            
+                            best_dist[i] = current_dist;
+                            best_id[i] = current_id;
+                            
+                            current_dist = tmp_dist;
+                            current_id = tmp_id;
+                        }
                     }
                 }
             }
 
             for (int t = 0; t < k; ++t)
             {
-                nbr[t * n + query] = (t < filled) ? best_id[t] : -1;
+                nbr[t * n + query] = best_id[t];
             }
         }
 
