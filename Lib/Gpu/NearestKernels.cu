@@ -24,45 +24,55 @@ namespace Gpu
                 return;
             }
 
+            // Force arrays into hardware registers 
             double best_dist[kMaxNeighbours];
             int    best_id[kMaxNeighbours];
-            int    filled = 0;
-            int    farthest = 0;
 
-            const double qx = query_x[query];
-            const double qy = query_y[query];
+            #pragma unroll
+            for (int i = 0; i < kMaxNeighbours; ++i)
+            {
+                best_dist[i] = 1e30; 
+                best_id[i]   = -1;
+            }
+
+            const double qx = __ldg(&query_x[query]);
+            const double qy = __ldg(&query_y[query]);
 
             for (int i = 0; i < n_survivors; ++i)
             {
-                const double dx = survivor_x[i] - qx;
-                const double dy = survivor_y[i] - qy;
+                // __ldg is CRITICAL here: the entire warp reads the same 'i' simultaneously, 
+                // allowing the L1 cache to broadcast the coordinates to all 32 threads instantly.
+                const double sx = __ldg(&survivor_x[i]);
+                const double sy = __ldg(&survivor_y[i]);
+                
+                const double dx = sx - qx;
+                const double dy = sy - qy;
                 const double dist2 = dx * dx + dy * dy;
 
-                if (filled < k)
+                // Only engage the update logic if it beats our worst tracked neighbor
+                if (dist2 < best_dist[k - 1])
                 {
-                    best_dist[filled] = dist2;
-                    best_id[filled] = survivor_ids[i];
-                    if (dist2 > best_dist[farthest])
+                    double current_dist = dist2;
+                    // Delay reading the ID from RAM until we mathematically know it's a hit
+                    int current_id = __ldg(&survivor_ids[i]); 
+                    
+                    // Fully unrolled "Bubble Down" insertion sort
+                    #pragma unroll
+                    for (int t = 0; t < kMaxNeighbours; ++t)
                     {
-                        farthest = filled;
-                    }
-                    ++filled;
-                    continue;
-                }
-
-                if (dist2 >= best_dist[farthest])
-                {
-                    continue;
-                }
-
-                best_dist[farthest] = dist2;
-                best_id[farthest] = survivor_ids[i];
-                farthest = 0;
-                for (int t = 1; t < k; ++t)
-                {
-                    if (best_dist[t] > best_dist[farthest])
-                    {
-                        farthest = t;
+                        if (t >= k) break; 
+                        
+                        if (current_dist < best_dist[t])
+                        {
+                            double tmp_dist = best_dist[t];
+                            int tmp_id = best_id[t];
+                            
+                            best_dist[t] = current_dist;
+                            best_id[t] = current_id;
+                            
+                            current_dist = tmp_dist;
+                            current_id = tmp_id;
+                        }
                     }
                 }
             }
@@ -70,7 +80,7 @@ namespace Gpu
             int* out = neighbour_ids + query * k;
             for (int t = 0; t < k; ++t)
             {
-                out[t] = (t < filled) ? best_id[t] : -1;
+                out[t] = best_id[t];
             }
         }
     }
