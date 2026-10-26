@@ -216,14 +216,101 @@ namespace Gpu
             }
         }
 
+        __device__ inline double local_dist(
+            int i, int j,
+            const float* rx, const float* ry,
+            float depot_x, float depot_y)
+        {
+            const float ax = (i < 0) ? depot_x : rx[i];
+            const float ay = (i < 0) ? depot_y : ry[i];
+            const float bx = (j < 0) ? depot_x : rx[j];
+            const float by = (j < 0) ? depot_y : ry[j];
+            const float dx = ax - bx;
+            const float dy = ay - by;
+            return static_cast<double>(sqrtf(dx * dx + dy * dy));
+        }
+
+        __device__ double local_calc_tour_cost(
+            const int* tour, int sz,
+            const float* rx, const float* ry,
+            float depot_x, float depot_y)
+        {
+            double cost = local_dist(-1, tour[0], rx, ry, depot_x, depot_y);
+            for (int i = 1; i < sz; ++i)
+            {
+                cost += local_dist(tour[i - 1], tour[i], rx, ry, depot_x, depot_y);
+            }
+            cost += local_dist(tour[sz - 1], -1, rx, ry, depot_x, depot_y);
+            return cost;
+        }
+
+        __device__ void local_gpu_tsp_approx(
+            int* tour, int sz,
+            const float* rx, const float* ry,
+            float depot_x, float depot_y)
+        {
+            for (int i = 0; i < sz; ++i) tour[i] = i;
+
+            for (int i = 0; i < sz - 1; ++i)
+            {
+                double best_dist = 1e30;
+                int best_pt = i;
+                const float prev_x = (i == 0) ? depot_x : rx[tour[i - 1]];
+                const float prev_y = (i == 0) ? depot_y : ry[tour[i - 1]];
+
+                for (int j = i; j < sz; ++j)
+                {
+                    const float dx = rx[tour[j]] - prev_x;
+                    const float dy = ry[tour[j]] - prev_y;
+                    const double d2 = static_cast<double>(dx * dx + dy * dy);
+                    if (d2 < best_dist)
+                    {
+                        best_dist = d2;
+                        best_pt = j;
+                    }
+                }
+                const int tmp = tour[i];
+                tour[i] = tour[best_pt];
+                tour[best_pt] = tmp;
+            }
+        }
+
+        __device__ void local_gpu_tsp_2opt(
+            int* tour, int sz,
+            const float* rx, const float* ry,
+            float depot_x, float depot_y)
+        {
+            while (true)
+            {
+                bool found = false;
+                for (int i = 0; i < sz - 1; ++i)
+                {
+                    for (int k = i + 1; k < sz; ++k)
+                    {
+                        const int a = (i == 0) ? -1 : tour[i - 1];
+                        const int b = tour[i];
+                        const int c = tour[k];
+                        const int d = (k == sz - 1) ? -1 : tour[k + 1];
+                        const double delta =
+                            local_dist(a, c, rx, ry, depot_x, depot_y) + local_dist(b, d, rx, ry, depot_x, depot_y)
+                          - local_dist(a, b, rx, ry, depot_x, depot_y) - local_dist(c, d, rx, ry, depot_x, depot_y);
+                        if (delta < 0.0)
+                        {
+                            reverse_tour_segment(tour, i, k);
+                            found = true;
+                        }
+                    }
+                }
+                if (!found) break;
+            }
+        }
+
         /*
-         * Same first-improvement 2-opt as before: nested (i, k), accept as soon as
-         * the tour is shorter, keep scanning the updated tour, two idle passes to stop.
-         * Length change is four edges (depot if i==0 or k==sz-1); reverse only on accept.
+         * First-improvement 2-opt: nested (i, k), accept as soon as
+         * the tour is shorter, stop as soon as a full pass finds no improvements.
          */
         __device__ void gpu_tsp_2opt(int* tour, int sz, int depot, const double* x, const double* y) {
-            int improve = 0;
-            while (improve < 2) {
+            while (true) {
                 bool found = false;
                 for (int i = 0; i < sz - 1; ++i) {
                     for (int k = i + 1; k < sz; ++k) {
@@ -236,19 +323,18 @@ namespace Gpu
                           - dist_global(a, b, x, y) - dist_global(c, d, x, y);
                         if (delta < 0.0) {
                             reverse_tour_segment(tour, i, k);
-                            improve = 0;
                             found = true;
                         }
                     }
                 }
-                if (!found) improve++;
+                if (!found) break;
             }
         }
 
         __global__ void batched_postprocess_kernel(
             const int* bucket_nodes, int bucket_offset,
             int* d_num_routes, int* route_offsets, int* route_nodes,
-            int* flat_scratch, const double* x, const double* y)
+            int* flat_scratch, const double* __restrict__ x, const double* __restrict__ y)
         {
             int num_routes = *d_num_routes;
             const int r = blockIdx.x * blockDim.x + threadIdx.x;
@@ -260,25 +346,76 @@ namespace Gpu
             if (sz <= 2) return;
 
             const int depot = bucket_nodes[bucket_offset];
-            
-            int* orig  = route_nodes + start;
-            int* tour1 = flat_scratch + (start * 3);
-            int* tour2 = flat_scratch + (start * 3) + sz;
+            int* orig = route_nodes + start;
 
-            for(int i=0; i<sz; ++i) tour2[i] = orig[i];
-            gpu_tsp_2opt(tour2, sz, depot, x, y);
-            double cost2 = calc_tour_cost(tour2, sz, depot, x, y);
+            constexpr int kMaxLocalRouteSz = 128;
 
-            gpu_tsp_approx(orig, tour1, sz, depot, x, y);
-            gpu_tsp_2opt(tour1, sz, depot, x, y);
-            double cost1 = calc_tour_cost(tour1, sz, depot, x, y);
+            if (sz <= kMaxLocalRouteSz)
+            {
+                const float depot_x = __double2float_rn(__ldg(&x[depot]));
+                const float depot_y = __double2float_rn(__ldg(&y[depot]));
 
-            double orig_cost = calc_tour_cost(orig, sz, depot, x, y);
+                float rx[kMaxLocalRouteSz];
+                float ry[kMaxLocalRouteSz];
+                int   local_orig[kMaxLocalRouteSz];
+                int   tour1[kMaxLocalRouteSz];
+                int   tour2[kMaxLocalRouteSz];
 
-            if (cost1 < cost2 && cost1 < orig_cost) {
-                for(int i=0; i<sz; ++i) orig[i] = tour1[i];
-            } else if (cost2 < cost1 && cost2 < orig_cost) {
-                for(int i=0; i<sz; ++i) orig[i] = tour2[i];
+                for (int i = 0; i < sz; ++i)
+                {
+                    const int node = orig[i];
+                    local_orig[i] = node;
+                    rx[i] = __double2float_rn(__ldg(&x[node]));
+                    ry[i] = __double2float_rn(__ldg(&y[node]));
+                    tour2[i] = i;
+                }
+
+                local_gpu_tsp_2opt(tour2, sz, rx, ry, depot_x, depot_y);
+                const double cost2 = local_calc_tour_cost(tour2, sz, rx, ry, depot_x, depot_y);
+
+                local_gpu_tsp_approx(tour1, sz, rx, ry, depot_x, depot_y);
+                local_gpu_tsp_2opt(tour1, sz, rx, ry, depot_x, depot_y);
+                const double cost1 = local_calc_tour_cost(tour1, sz, rx, ry, depot_x, depot_y);
+
+                double orig_cost = local_dist(-1, 0, rx, ry, depot_x, depot_y);
+                for (int i = 1; i < sz; ++i)
+                {
+                    orig_cost += local_dist(i - 1, i, rx, ry, depot_x, depot_y);
+                }
+                orig_cost += local_dist(sz - 1, -1, rx, ry, depot_x, depot_y);
+
+                if (cost1 < cost2 && cost1 < orig_cost)
+                {
+                    for (int i = 0; i < sz; ++i) orig[i] = local_orig[tour1[i]];
+                }
+                else if (cost2 < cost1 && cost2 < orig_cost)
+                {
+                    for (int i = 0; i < sz; ++i) orig[i] = local_orig[tour2[i]];
+                }
+            }
+            else
+            {
+                int* tour1 = flat_scratch + (start * 3);
+                int* tour2 = flat_scratch + (start * 3) + sz;
+
+                for (int i = 0; i < sz; ++i) tour2[i] = orig[i];
+                gpu_tsp_2opt(tour2, sz, depot, x, y);
+                double cost2 = calc_tour_cost(tour2, sz, depot, x, y);
+
+                gpu_tsp_approx(orig, tour1, sz, depot, x, y);
+                gpu_tsp_2opt(tour1, sz, depot, x, y);
+                double cost1 = calc_tour_cost(tour1, sz, depot, x, y);
+
+                double orig_cost = calc_tour_cost(orig, sz, depot, x, y);
+
+                if (cost1 < cost2 && cost1 < orig_cost)
+                {
+                    for (int i = 0; i < sz; ++i) orig[i] = tour1[i];
+                }
+                else if (cost2 < cost1 && cost2 < orig_cost)
+                {
+                    for (int i = 0; i < sz; ++i) orig[i] = tour2[i];
+                }
             }
         }
 
@@ -445,8 +582,9 @@ namespace Gpu
                 storage.route_nodes + bucket_id * max_k);
             CUDA_CHECK(cudaEventRecord(ev.mat, stream));
 
-            int blocks = (k + kThreadsPerBlock - 1) / kThreadsPerBlock;
-            batched_postprocess_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
+            constexpr int kPostprocessThreads = 64;
+            int blocks = (k + kPostprocessThreads - 1) / kPostprocessThreads;
+            batched_postprocess_kernel<<<blocks, kPostprocessThreads, 0, stream>>>(
                 device.device_bucket_nodes(), bucket_offset,
                 storage.num_routes + bucket_id,
                 storage.route_offsets + bucket_id * (max_k + 1),
