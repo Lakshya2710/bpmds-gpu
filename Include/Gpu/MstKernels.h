@@ -30,6 +30,7 @@ namespace Gpu
     {
         int* row_offsets = nullptr;
         int* cols        = nullptr;
+        int* parents     = nullptr;
     };
 
     void allocate_mst_bucket_scratch(MstBucketScratch& scratch, int max_k);

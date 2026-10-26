@@ -203,6 +203,69 @@ namespace Gpu
             zero_degrees_kernel<<<launch_blocks(k, kThreadsPerBlock), kThreadsPerBlock, 0, stream>>>(degrees, k);
             fill_mst_cols_kernel<<<launch_blocks(edge_count, kThreadsPerBlock), kThreadsPerBlock, 0, stream>>>(mst_u, mst_v, edge_count, degrees, row_offsets, cols);
         }
+
+        void orient_tree_parents(
+            const int* d_mst_u,
+            const int* d_mst_v,
+            int edge_count,
+            int k,
+            int* d_parents,
+            cudaStream_t stream)
+        {
+            if (k <= 1) return;
+            if (k == 2)
+            {
+                int h_p[2] = {-1, 0};
+                CUDA_CHECK(cudaMemcpyAsync(d_parents, h_p, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
+                return;
+            }
+
+            std::vector<int> h_u(edge_count);
+            std::vector<int> h_v(edge_count);
+            CUDA_CHECK(cudaMemcpyAsync(h_u.data(), d_mst_u, edge_count * sizeof(int), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaMemcpyAsync(h_v.data(), d_mst_v, edge_count * sizeof(int), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            std::vector<int> head(k, -1);
+            std::vector<int> to(edge_count * 2);
+            std::vector<int> next(edge_count * 2);
+            int edge_idx = 0;
+
+            auto add_edge = [&](int u, int v) {
+                to[edge_idx] = v;
+                next[edge_idx] = head[u];
+                head[u] = edge_idx++;
+            };
+
+            for (int i = 0; i < edge_count; ++i)
+            {
+                add_edge(h_u[i], h_v[i]);
+                add_edge(h_v[i], h_u[i]);
+            }
+
+            std::vector<int> h_parents(k, -2);
+            std::vector<int> queue(k);
+            int q_head = 0, q_tail = 0;
+
+            h_parents[0] = -1;
+            queue[q_tail++] = 0;
+
+            while (q_head < q_tail)
+            {
+                const int u = queue[q_head++];
+                for (int e = head[u]; e != -1; e = next[e])
+                {
+                    const int v = to[e];
+                    if (h_parents[v] == -2)
+                    {
+                        h_parents[v] = u;
+                        queue[q_tail++] = v;
+                    }
+                }
+            }
+
+            CUDA_CHECK(cudaMemcpyAsync(d_parents, h_parents.data(), k * sizeof(int), cudaMemcpyHostToDevice, stream));
+        }
     }
 
     void allocate_mst_bucket_scratch(MstBucketScratch& scratch, int max_k)
@@ -233,14 +296,17 @@ namespace Gpu
     {
         CUDA_CHECK(cudaMalloc(&storage.row_offsets, num_buckets * (max_k + 1) * sizeof(int)));
         CUDA_CHECK(cudaMalloc(&storage.cols, num_buckets * 2 * max_k * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&storage.parents, num_buckets * max_k * sizeof(int)));
         CUDA_CHECK(cudaMemset(storage.row_offsets, 0, num_buckets * (max_k + 1) * sizeof(int)));
         CUDA_CHECK(cudaMemset(storage.cols, 0, num_buckets * 2 * max_k * sizeof(int)));
+        CUDA_CHECK(cudaMemset(storage.parents, -1, num_buckets * max_k * sizeof(int)));
     }
 
     void free_mst_device_storage(MstDeviceStorage& storage)
     {
         cudaFree(storage.row_offsets);
         cudaFree(storage.cols);
+        cudaFree(storage.parents);
         storage = {};
     }
 
@@ -261,6 +327,8 @@ namespace Gpu
         if (k == 2)
         {
             init_mst_k2_kernel<<<1, 1, 0, stream>>>(row_offsets, cols, max_k);
+            int h_p[2] = {-1, 0};
+            CUDA_CHECK(cudaMemcpyAsync(storage.parents + bucket_id * max_k, h_p, 2 * sizeof(int), cudaMemcpyHostToDevice, stream));
             return;
         }
 
@@ -298,6 +366,7 @@ namespace Gpu
         if (edge_count <= 0) return;
 
         build_csr_from_edges(row_offsets, cols, scratch.parent, scratch.mst_u, scratch.mst_v, edge_count, k, stream);
+        orient_tree_parents(scratch.mst_u, scratch.mst_v, edge_count, k, storage.parents + bucket_id * max_k, stream);
     }
 
     void build_all_msts_on_streams(
