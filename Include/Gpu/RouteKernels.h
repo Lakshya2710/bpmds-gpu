@@ -19,9 +19,10 @@ namespace Gpu
         double* bx            = nullptr; // num_buckets * max_k, local-order x
         double* by            = nullptr; // num_buckets * max_k, local-order y
         double* bdemand       = nullptr; // num_buckets * max_k, local-order demand
+        int*    trial_scratch = nullptr; // contiguous scratch for all buckets
     };
 
-    void allocate_route_trial_storage(RouteTrialStorage& storage, int num_buckets, int rho, int max_k);
+    void allocate_route_trial_storage(RouteTrialStorage& storage, int num_buckets, int rho, int max_k, size_t total_nodes = 0);
     void free_route_trial_storage(RouteTrialStorage& storage);
 
     /*

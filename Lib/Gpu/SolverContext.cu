@@ -99,6 +99,8 @@ namespace Gpu
         impl_->free_streams();
         impl_->allocate_streams();
         impl_->allocate_mst_resources();
+        free_route_trial_storage(impl_->route_storage);
+        impl_->route_rho = -1;
     }
 
     void SolverContext::build_all_msts_streamed()
@@ -122,11 +124,13 @@ namespace Gpu
         if (impl_->route_rho != rho)
         {
             free_route_trial_storage(impl_->route_storage);
+            const size_t total_nodes = impl_->h_offsets.empty() ? 0 : static_cast<size_t>(impl_->h_offsets.back());
             allocate_route_trial_storage(
                 impl_->route_storage,
                 impl_->num_buckets,
                 rho,
-                impl_->max_bucket_size);
+                impl_->max_bucket_size,
+                total_nodes);
             impl_->route_rho = rho;
         }
 

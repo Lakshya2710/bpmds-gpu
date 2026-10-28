@@ -431,9 +431,9 @@ namespace Gpu
             int                      k,
             const int*               row_offsets,
             const int*               cols,
-            const int* __restrict__  mst_parents,
-            const double*            bx,
-            const double*            by,
+            const int* __restrict__  /* mst_parents */,
+            const double*            /* bx */,
+            const double*            /* by */,
             const double*            bdemand,
             double                   capacity,
             int                      bucket_id,
@@ -466,7 +466,7 @@ namespace Gpu
             unsigned int rng = static_cast<unsigned int>(bucket_id * 1000003 + best_trial * 9176u + 12345u);
 
             int* stack_v = scratch;
-            int* curr_route = scratch + k;
+            int* stack_p = scratch + k;
 
             double residue    = capacity;
 
@@ -475,15 +475,16 @@ namespace Gpu
             if (out_route_offsets) out_route_offsets[0] = 0;
 
             int top = 0;
-            int route_len = 0;
 
             stack_v[0] = 0;
+            stack_p[0] = -1;
             top = 1;
 
             while (top > 0)
             {
                 --top;
                 const int u_idx = stack_v[top];
+                const int parent_u = stack_p[top];
 
                 if (u_idx != 0)
                 {
@@ -491,19 +492,18 @@ namespace Gpu
 
                     if (residue < u_demand)
                     {
-                        for (int i = 0; i < route_len; ++i)
-                            out_route_nodes[out_node_write++] = curr_route[i];
-                        out_route_offsets[out_route_count + 1] = out_node_write;
-                        route_len = 0;
+                        if (out_route_offsets)
+                        {
+                            out_route_offsets[out_route_count + 1] = out_node_write;
+                        }
                         ++out_route_count;
-                        residue    = capacity;
+                        residue = capacity;
                     }
 
-                    curr_route[route_len++] = bucket_nodes[bucket_offset + u_idx];
+                    out_route_nodes[out_node_write++] = bucket_nodes[bucket_offset + u_idx];
                     residue -= u_demand;
                 }
 
-                const int parent_u = __ldg(&mst_parents[u_idx]);
                 const int start_top = top;
                 const int row_start = row_offsets[u_idx];
                 const int deg       = row_offsets[u_idx + 1] - row_start;
@@ -516,6 +516,7 @@ namespace Gpu
                         continue;
                     }
                     stack_v[top] = v_idx;
+                    stack_p[top] = u_idx;
                     ++top;
                 }
 
@@ -532,11 +533,12 @@ namespace Gpu
                 }
             }
 
-            if (route_len > 0)
+            if (out_node_write > (out_route_offsets ? out_route_offsets[out_route_count] : 0))
             {
-                for (int i = 0; i < route_len; ++i)
-                    out_route_nodes[out_node_write++] = curr_route[i];
-                out_route_offsets[out_route_count + 1] = out_node_write;
+                if (out_route_offsets)
+                {
+                    out_route_offsets[out_route_count + 1] = out_node_write;
+                }
                 ++out_route_count;
             }
 
@@ -601,6 +603,7 @@ namespace Gpu
             double* bx      = storage.bx + bucket_id * max_k;
             double* by      = storage.by + bucket_id * max_k;
             double* bdemand = storage.bdemand + bucket_id * max_k;
+            int* d_scratch  = storage.trial_scratch + static_cast<size_t>(bucket_offset) * kMaxTrialThreads;
 
             ev.used = true;
             CUDA_CHECK(cudaEventRecord(ev.t0, stream));
@@ -614,11 +617,6 @@ namespace Gpu
 
             const int active_blocks  = choose_trial_blocks(rho);
             const int active_threads = active_blocks * kThreadsPerBlock;
-            const size_t eval_scratch_ints = static_cast<size_t>(active_threads) * static_cast<size_t>(k);
-            const size_t mat_scratch_ints  = static_cast<size_t>(2 * k);
-            const size_t scratch_ints = std::max(eval_scratch_ints, mat_scratch_ints);
-            int* d_scratch;
-            CUDA_CHECK(cudaMallocAsync(&d_scratch, scratch_ints * sizeof(int), stream));
 
             evaluate_routes_kernel<<<active_blocks, kThreadsPerBlock, 0, stream>>>(
                 k, row_offsets, cols, parents,
@@ -645,12 +643,10 @@ namespace Gpu
                 d_scratch, device.device_x(), device.device_y()
             );
             CUDA_CHECK(cudaEventRecord(ev.opt, stream));
-
-            CUDA_CHECK(cudaFreeAsync(d_scratch, stream));
         }
     }
 
-    void allocate_route_trial_storage(RouteTrialStorage& storage, int num_buckets, int rho, int max_k)
+    void allocate_route_trial_storage(RouteTrialStorage& storage, int num_buckets, int rho, int max_k, size_t total_nodes)
     {
         CUDA_CHECK(cudaMalloc(&storage.trial_costs, num_buckets * rho * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&storage.num_routes, num_buckets * sizeof(int)));
@@ -659,6 +655,9 @@ namespace Gpu
         CUDA_CHECK(cudaMalloc(&storage.bx, num_buckets * max_k * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&storage.by, num_buckets * max_k * sizeof(double)));
         CUDA_CHECK(cudaMalloc(&storage.bdemand, num_buckets * max_k * sizeof(double)));
+
+        const size_t scratch_nodes = (total_nodes > 0) ? total_nodes : static_cast<size_t>(num_buckets) * max_k;
+        CUDA_CHECK(cudaMalloc(&storage.trial_scratch, scratch_nodes * kMaxTrialThreads * sizeof(int)));
     }
 
     void free_route_trial_storage(RouteTrialStorage& storage)
@@ -670,6 +669,7 @@ namespace Gpu
         cudaFree(storage.bx);
         cudaFree(storage.by);
         cudaFree(storage.bdemand);
+        cudaFree(storage.trial_scratch);
         storage = {};
     }
 
