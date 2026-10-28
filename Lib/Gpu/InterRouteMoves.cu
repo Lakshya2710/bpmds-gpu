@@ -42,10 +42,62 @@ namespace Gpu
 
         // Column-major neighbours: nbr[t * n + query] so a warp reading the
         // same t touches consecutive addresses.
+        // Uses bounding-box tile pruning and FP32 packed coordinates.
+        constexpr int kTileSize = 256;
+
+        __device__ __forceinline__ void evaluate_tile_candidates(
+            const float2* __restrict__ coords,
+            const int*    __restrict__ route_of,
+            int start, int end,
+            int query, int qroute, float qx, float qy,
+            int k,
+            float* best_dist,
+            int* best_id)
+        {
+            #pragma unroll 4
+            for (int s = start; s < end; ++s)
+            {
+                if (s == query) continue;
+
+                const int sroute = __ldg(&route_of[s]);
+                if (sroute == qroute) continue;
+
+                const float2 cs = __ldg(&coords[s]);
+                const float dx = cs.x - qx;
+                const float dy = cs.y - qy;
+                const float dist2 = dx * dx + dy * dy;
+
+                if (dist2 < best_dist[k - 1])
+                {
+                    float current_dist = dist2;
+                    int   current_id   = s;
+
+                    #pragma unroll
+                    for (int i = 0; i < kMaxNeighbours; ++i)
+                    {
+                        if (i >= k) break;
+
+                        if (current_dist < best_dist[i])
+                        {
+                            const float tmp_dist = best_dist[i];
+                            const int   tmp_id   = best_id[i];
+
+                            best_dist[i] = current_dist;
+                            best_id[i]   = current_id;
+
+                            current_dist = tmp_dist;
+                            current_id   = tmp_id;
+                        }
+                    }
+                }
+            }
+        }
+
         __global__ void pool_neighbour_kernel(
-            const double* __restrict__ x,
-            const double* __restrict__ y,
-            const int* __restrict__ route_of,
+            const float2* __restrict__ coords,
+            const int*    __restrict__ route_of,
+            const float4* __restrict__ tile_boxes,
+            int num_tiles,
             int n,
             int k,
             int* __restrict__ nbr)
@@ -56,65 +108,53 @@ namespace Gpu
                 return;
             }
 
-            // Force arrays into registers by initializing them with fixed bounds
-            double best_dist[kMaxNeighbours];
-            int best_id[kMaxNeighbours];
+            float best_dist[kMaxNeighbours];
+            int   best_id[kMaxNeighbours];
 
             #pragma unroll
             for (int i = 0; i < kMaxNeighbours; ++i)
             {
-                best_dist[i] = 1e30; // Infinity removes the need for a 'filled' tracker
-                best_id[i] = -1;
+                best_dist[i] = 1e30f;
+                best_id[i]   = -1;
             }
 
-            // Wrap reads in __ldg() to use the instant L1 Texture Cache
-            const double qx = __ldg(&x[query]);
-            const double qy = __ldg(&y[query]);
+            const float2 q = __ldg(&coords[query]);
+            const float qx = q.x;
+            const float qy = q.y;
             const int qroute = __ldg(&route_of[query]);
 
-            for (int s = 0; s < n; ++s)
-            {
-                if (s == query)
-                {
-                    continue;
-                }
-                
-                const int sroute = __ldg(&route_of[s]);
-                if (sroute == qroute)
-                {
-                    continue;
-                }
-                
-                const double dx = __ldg(&x[s]) - qx;
-                const double dy = __ldg(&y[s]) - qy;
-                const double dist2 = dx * dx + dy * dy;
+            // 1. Evaluate own tile first!
+            // Since candidates in the query's own tile are in adjacent routes in the same
+            // geographic neighborhood, this immediately initializes best_dist[k - 1] to
+            // a small local distance.
+            const int own_tile = blockIdx.x;
+            const int own_start = own_tile * kTileSize;
+            const int own_end   = min(n, own_start + kTileSize);
+            evaluate_tile_candidates(
+                coords, route_of, own_start, own_end,
+                query, qroute, qx, qy, k, best_dist, best_id);
 
-                // Only engage the update logic if it beats our worst tracked neighbor
-                if (dist2 < best_dist[k - 1])
+            // 2. Loop through all other tiles with bounding-box pruning
+            for (int t = 0; t < num_tiles; ++t)
+            {
+                if (t == own_tile) continue;
+
+                const float4 box = __ldg(&tile_boxes[t]);
+                const float dx_box = fmaxf(0.0f, fmaxf(box.x - qx, qx - box.y));
+                const float dy_box = fmaxf(0.0f, fmaxf(box.z - qy, qy - box.w));
+                const float box_dist2 = dx_box * dx_box + dy_box * dy_box;
+
+                // If the entire tile is further than our current k-th nearest neighbor, prune it!
+                if (box_dist2 >= best_dist[k - 1])
                 {
-                    double current_dist = dist2;
-                    int current_id = s;
-                    
-                    // A fully unrolled "Bubble Down" insertion sort
-                    // This strictly forces the arrays to remain in registers.
-                    #pragma unroll
-                    for (int i = 0; i < kMaxNeighbours; ++i)
-                    {
-                        if (i >= k) break; 
-                        
-                        if (current_dist < best_dist[i])
-                        {
-                            double tmp_dist = best_dist[i];
-                            int tmp_id = best_id[i];
-                            
-                            best_dist[i] = current_dist;
-                            best_id[i] = current_id;
-                            
-                            current_dist = tmp_dist;
-                            current_id = tmp_id;
-                        }
-                    }
+                    continue;
                 }
+
+                const int t_start = t * kTileSize;
+                const int t_end   = min(n, t_start + kTileSize);
+                evaluate_tile_candidates(
+                    coords, route_of, t_start, t_end,
+                    query, qroute, qx, qy, k, best_dist, best_id);
             }
 
             for (int t = 0; t < k; ++t)
@@ -381,9 +421,40 @@ namespace Gpu
         CUDA_CHECK(cudaMemcpy(d_succ, succ.data(), n * sizeof(int), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_route, route_of.data(), n * sizeof(int), cudaMemcpyHostToDevice));
 
-        constexpr int threads = 128;
+        const int num_tiles = (n + kTileSize - 1) / kTileSize;
+        std::vector<float4> tile_boxes(num_tiles);
+        std::vector<float2> coords(n);
+        for (int t = 0; t < num_tiles; ++t)
+        {
+            float xmin = 1e30f;
+            float xmax = -1e30f;
+            float ymin = 1e30f;
+            float ymax = -1e30f;
+            const int start = t * kTileSize;
+            const int end   = std::min(n, start + kTileSize);
+            for (int i = start; i < end; ++i)
+            {
+                const float px = static_cast<float>(x[i]);
+                const float py = static_cast<float>(y[i]);
+                coords[i] = make_float2(px, py);
+                if (px < xmin) xmin = px;
+                if (px > xmax) xmax = px;
+                if (py < ymin) ymin = py;
+                if (py > ymax) ymax = py;
+            }
+            tile_boxes[t] = make_float4(xmin, xmax, ymin, ymax);
+        }
+
+        float2* d_coords = nullptr;
+        float4* d_tile_boxes = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_coords, n * sizeof(float2)));
+        CUDA_CHECK(cudaMalloc(&d_tile_boxes, num_tiles * sizeof(float4)));
+        CUDA_CHECK(cudaMemcpy(d_coords, coords.data(), n * sizeof(float2), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_tile_boxes, tile_boxes.data(), num_tiles * sizeof(float4), cudaMemcpyHostToDevice));
+
+        constexpr int threads = 256;
         const int blocks = (n + threads - 1) / threads;
-        pool_neighbour_kernel<<<blocks, threads>>>(d_x, d_y, d_route, n, k, d_nbr);
+        pool_neighbour_kernel<<<blocks, threads>>>(d_coords, d_route, d_tile_boxes, num_tiles, n, k, d_nbr);
         CUDA_CHECK(cudaGetLastError());
         evaluate_moves_kernel<<<blocks, threads>>>(
             d_x, d_y, d_demand, d_cum, d_pred, d_succ, d_route, d_route_load, d_nbr,
@@ -399,6 +470,8 @@ namespace Gpu
         CUDA_CHECK(cudaMemcpy(best_arg.data(), d_best_arg, n * sizeof(int), cudaMemcpyDeviceToHost));
         CUDA_CHECK(cudaMemcpy(best_rv.data(), d_best_rv, n * sizeof(int), cudaMemcpyDeviceToHost));
 
+        cudaFree(d_coords);
+        cudaFree(d_tile_boxes);
         cudaFree(d_x);
         cudaFree(d_y);
         cudaFree(d_demand);

@@ -16,8 +16,7 @@ namespace Gpu
         int*    num_routes    = nullptr; // num_buckets (winner only)
         int*    route_offsets = nullptr; // num_buckets * (max_k + 1) (winner only)
         int*    route_nodes   = nullptr; // num_buckets * max_k (winner only)
-        double* bx            = nullptr; // num_buckets * max_k, local-order x
-        double* by            = nullptr; // num_buckets * max_k, local-order y
+        float2* bcoords       = nullptr; // num_buckets * max_k, local-order (x, y)
         double* bdemand       = nullptr; // num_buckets * max_k, local-order demand
         int*    trial_scratch = nullptr; // contiguous scratch for all buckets
     };

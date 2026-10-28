@@ -1,22 +1,75 @@
 #include "Gpu/NearestKernels.h"
 #include "Gpu/CudaCommon.h"
 
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
 namespace Gpu
 {
     namespace
     {
         constexpr int kMaxNeighbours = 32;
+        constexpr int kTileSize      = 256;
+
+        inline size_t align256(size_t bytes)
+        {
+            return (bytes + 255) & ~size_t(255);
+        }
+
+        __device__ __forceinline__ void evaluate_tile_candidates(
+            const float2* __restrict__ survivor_coords,
+            const int*    __restrict__ survivor_ids,
+            int start, int end,
+            float qx, float qy,
+            int k,
+            float* best_dist,
+            int* best_id)
+        {
+            #pragma unroll 4
+            for (int s = start; s < end; ++s)
+            {
+                const float2 cs = __ldg(&survivor_coords[s]);
+                const float dx = cs.x - qx;
+                const float dy = cs.y - qy;
+                const float dist2 = dx * dx + dy * dy;
+
+                if (dist2 < best_dist[k - 1])
+                {
+                    float current_dist = dist2;
+                    int   current_id   = __ldg(&survivor_ids[s]);
+
+                    #pragma unroll
+                    for (int t = 0; t < kMaxNeighbours; ++t)
+                    {
+                        if (t >= k) break;
+
+                        if (current_dist < best_dist[t])
+                        {
+                            const float tmp_dist = best_dist[t];
+                            const int   tmp_id   = best_id[t];
+
+                            best_dist[t] = current_dist;
+                            best_id[t]   = current_id;
+
+                            current_dist = tmp_dist;
+                            current_id   = tmp_id;
+                        }
+                    }
+                }
+            }
+        }
 
         __global__ void nearest_surviving_customers_kernel(
-            const double* __restrict__ survivor_x,
-            const double* __restrict__ survivor_y,
+            const float2* __restrict__ survivor_coords,
             const int*    __restrict__ survivor_ids,
+            const float4* __restrict__ tile_boxes,
+            int                        num_tiles,
             int                        n_survivors,
-            const double* __restrict__ query_x,
-            const double* __restrict__ query_y,
+            const float2* __restrict__ query_coords,
             int                        n_queries,
             int                        k,
-            int*                       neighbour_ids)
+            int*          __restrict__ neighbour_ids)
         {
             const int query = blockIdx.x * blockDim.x + threadIdx.x;
             if (query >= n_queries)
@@ -24,57 +77,76 @@ namespace Gpu
                 return;
             }
 
-            // Force arrays into hardware registers 
-            double best_dist[kMaxNeighbours];
-            int    best_id[kMaxNeighbours];
+            // Force arrays into hardware registers
+            float best_dist[kMaxNeighbours];
+            int   best_id[kMaxNeighbours];
 
             #pragma unroll
             for (int i = 0; i < kMaxNeighbours; ++i)
             {
-                best_dist[i] = 1e30; 
+                best_dist[i] = 1e30f;
                 best_id[i]   = -1;
             }
 
-            const double qx = __ldg(&query_x[query]);
-            const double qy = __ldg(&query_y[query]);
+            const float2 q = __ldg(&query_coords[query]);
+            const float qx = q.x;
+            const float qy = q.y;
 
-            for (int i = 0; i < n_survivors; ++i)
+            // Pass 1: Find the tile whose bounding box is closest to (qx, qy).
+            // All threads in a warp load tile_boxes[t] simultaneously with L1 warp broadcast.
+            int   best_tile    = 0;
+            float min_box_dist = 1e30f;
+
+            for (int t = 0; t < num_tiles; ++t)
             {
-                // __ldg is CRITICAL here: the entire warp reads the same 'i' simultaneously, 
-                // allowing the L1 cache to broadcast the coordinates to all 32 threads instantly.
-                const double sx = __ldg(&survivor_x[i]);
-                const double sy = __ldg(&survivor_y[i]);
-                
-                const double dx = sx - qx;
-                const double dy = sy - qy;
-                const double dist2 = dx * dx + dy * dy;
+                const float4 box = __ldg(&tile_boxes[t]);
+                const float dx = fmaxf(0.0f, fmaxf(box.x - qx, qx - box.y));
+                const float dy = fmaxf(0.0f, fmaxf(box.z - qy, qy - box.w));
+                const float box_dist2 = dx * dx + dy * dy;
 
-                // Only engage the update logic if it beats our worst tracked neighbor
-                if (dist2 < best_dist[k - 1])
+                if (box_dist2 < min_box_dist)
                 {
-                    double current_dist = dist2;
-                    // Delay reading the ID from RAM until we mathematically know it's a hit
-                    int current_id = __ldg(&survivor_ids[i]); 
-                    
-                    // Fully unrolled "Bubble Down" insertion sort
-                    #pragma unroll
-                    for (int t = 0; t < kMaxNeighbours; ++t)
-                    {
-                        if (t >= k) break; 
-                        
-                        if (current_dist < best_dist[t])
-                        {
-                            double tmp_dist = best_dist[t];
-                            int tmp_id = best_id[t];
-                            
-                            best_dist[t] = current_dist;
-                            best_id[t] = current_id;
-                            
-                            current_dist = tmp_dist;
-                            current_id = tmp_id;
-                        }
-                    }
+                    min_box_dist = box_dist2;
+                    best_tile    = t;
                 }
+            }
+
+            // Evaluate best tile first!
+            // Since this tile is geographically closest to (qx, qy), this immediately
+            // initializes best_dist[k - 1] to a tight local bound.
+            {
+                const int start = best_tile * kTileSize;
+                const int end   = min(start + kTileSize, n_survivors);
+                evaluate_tile_candidates(
+                    survivor_coords, survivor_ids,
+                    start, end,
+                    qx, qy, k,
+                    best_dist, best_id);
+            }
+
+            // Pass 2: Check all other tiles.
+            // If the tile bounding-box distance >= best_dist[k - 1], skip the entire tile!
+            for (int t = 0; t < num_tiles; ++t)
+            {
+                if (t == best_tile) continue;
+
+                const float4 box = __ldg(&tile_boxes[t]);
+                const float dx = fmaxf(0.0f, fmaxf(box.x - qx, qx - box.y));
+                const float dy = fmaxf(0.0f, fmaxf(box.z - qy, qy - box.w));
+                const float box_dist2 = dx * dx + dy * dy;
+
+                if (box_dist2 >= best_dist[k - 1])
+                {
+                    continue; // Pruned!
+                }
+
+                const int start = t * kTileSize;
+                const int end   = min(start + kTileSize, n_survivors);
+                evaluate_tile_candidates(
+                    survivor_coords, survivor_ids,
+                    start, end,
+                    qx, qy, k,
+                    best_dist, best_id);
             }
 
             int* out = neighbour_ids + query * k;
@@ -95,7 +167,7 @@ namespace Gpu
         std::vector<int>&          neighbour_ids)
     {
         const int n_survivors = static_cast<int>(survivor_ids.size());
-        const int n_queries = static_cast<int>(query_x.size());
+        const int n_queries   = static_cast<int>(query_x.size());
         neighbour_ids.assign(static_cast<size_t>(n_queries) * static_cast<size_t>(k), -1);
 
         if (n_queries == 0 || n_survivors == 0 || k <= 0)
@@ -107,39 +179,77 @@ namespace Gpu
             throw std::runtime_error("nearest neighbour k exceeds kernel capacity");
         }
 
-        double* d_sx = nullptr;
-        double* d_sy = nullptr;
-        int*    d_ids = nullptr;
-        double* d_qx = nullptr;
-        double* d_qy = nullptr;
-        int*    d_out = nullptr;
+        const int num_tiles = (n_survivors + kTileSize - 1) / kTileSize;
 
-        CUDA_CHECK(cudaMalloc(&d_sx, n_survivors * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&d_sy, n_survivors * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&d_ids, n_survivors * sizeof(int)));
-        CUDA_CHECK(cudaMalloc(&d_qx, n_queries * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&d_qy, n_queries * sizeof(double)));
-        CUDA_CHECK(cudaMalloc(&d_out, neighbour_ids.size() * sizeof(int)));
+        // Precompute tile bounding boxes and pack survivor coordinates into float2
+        std::vector<float2> survivor_coords(n_survivors);
+        std::vector<float4> tile_boxes(num_tiles);
 
-        CUDA_CHECK(cudaMemcpy(d_sx, survivor_x.data(), n_survivors * sizeof(double), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_sy, survivor_y.data(), n_survivors * sizeof(double), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_ids, survivor_ids.data(), n_survivors * sizeof(int), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_qx, query_x.data(), n_queries * sizeof(double), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_qy, query_y.data(), n_queries * sizeof(double), cudaMemcpyHostToDevice));
+        for (int t = 0; t < num_tiles; ++t)
+        {
+            const int start = t * kTileSize;
+            const int end   = std::min(start + kTileSize, n_survivors);
+            float min_x = 1e30f, max_x = -1e30f;
+            float min_y = 1e30f, max_y = -1e30f;
 
-        constexpr int threads = 128;
+            for (int i = start; i < end; ++i)
+            {
+                const float x = static_cast<float>(survivor_x[i]);
+                const float y = static_cast<float>(survivor_y[i]);
+                survivor_coords[i] = make_float2(x, y);
+
+                if (x < min_x) min_x = x;
+                if (x > max_x) max_x = x;
+                if (y < min_y) min_y = y;
+                if (y > max_y) max_y = y;
+            }
+            tile_boxes[t] = make_float4(min_x, max_x, min_y, max_y);
+        }
+
+        // Pack query coordinates into float2
+        std::vector<float2> query_coords(n_queries);
+        for (int i = 0; i < n_queries; ++i)
+        {
+            query_coords[i] = make_float2(
+                static_cast<float>(query_x[i]),
+                static_cast<float>(query_y[i]));
+        }
+
+        // Single contiguous device allocation (cuts down 6 separate cudaMalloc calls)
+        const size_t sz_survivor_coords = align256(n_survivors * sizeof(float2));
+        const size_t sz_survivor_ids    = align256(n_survivors * sizeof(int));
+        const size_t sz_query_coords    = align256(n_queries * sizeof(float2));
+        const size_t sz_tile_boxes      = align256(num_tiles * sizeof(float4));
+        const size_t sz_out             = align256(neighbour_ids.size() * sizeof(int));
+
+        const size_t total_bytes = sz_survivor_coords + sz_survivor_ids +
+                                   sz_query_coords + sz_tile_boxes + sz_out;
+
+        char* d_blob = nullptr;
+        CUDA_CHECK(cudaMalloc(&d_blob, total_bytes));
+
+        float2* d_survivor_coords = reinterpret_cast<float2*>(d_blob);
+        int*    d_survivor_ids    = reinterpret_cast<int*>(d_blob + sz_survivor_coords);
+        float2* d_query_coords    = reinterpret_cast<float2*>(d_blob + sz_survivor_coords + sz_survivor_ids);
+        float4* d_tile_boxes      = reinterpret_cast<float4*>(d_blob + sz_survivor_coords + sz_survivor_ids + sz_query_coords);
+        int*    d_out             = reinterpret_cast<int*>(d_blob + sz_survivor_coords + sz_survivor_ids + sz_query_coords + sz_tile_boxes);
+
+        CUDA_CHECK(cudaMemcpy(d_survivor_coords, survivor_coords.data(), n_survivors * sizeof(float2), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_survivor_ids, survivor_ids.data(), n_survivors * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_query_coords, query_coords.data(), n_queries * sizeof(float2), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_tile_boxes, tile_boxes.data(), num_tiles * sizeof(float4), cudaMemcpyHostToDevice));
+
+        constexpr int threads = 256;
         const int blocks = (n_queries + threads - 1) / threads;
+
         nearest_surviving_customers_kernel<<<blocks, threads>>>(
-            d_sx, d_sy, d_ids, n_survivors, d_qx, d_qy, n_queries, k, d_out);
+            d_survivor_coords, d_survivor_ids, d_tile_boxes, num_tiles,
+            n_survivors, d_query_coords, n_queries, k, d_out);
+
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         CUDA_CHECK(cudaMemcpy(neighbour_ids.data(), d_out, neighbour_ids.size() * sizeof(int), cudaMemcpyDeviceToHost));
 
-        cudaFree(d_sx);
-        cudaFree(d_sy);
-        cudaFree(d_ids);
-        cudaFree(d_qx);
-        cudaFree(d_qy);
-        cudaFree(d_out);
+        cudaFree(d_blob);
     }
 }
