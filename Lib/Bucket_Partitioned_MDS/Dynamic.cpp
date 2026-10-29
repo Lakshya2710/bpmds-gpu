@@ -586,6 +586,8 @@ namespace Bucket_Partitioned_MDS
         double move_seconds = 0.0;
         int move1_applied = 0;
         int move8_applied = 0;
+        int move9_applied = 0;
+        int move_passes = 0;
         const int pool_customers = static_cast<int>(pool_nodes.size()) - 1;
         if (pool_customers > 0)
         {
@@ -613,6 +615,8 @@ namespace Bucket_Partitioned_MDS
                 move_seconds = move_stats.seconds;
                 move1_applied = move_stats.move1;
                 move8_applied = move_stats.move8;
+                move9_applied = move_stats.move9;
+                move_passes = move_stats.passes;
             }
             for (auto& route : pool_routes)
             {
@@ -653,8 +657,10 @@ namespace Bucket_Partitioned_MDS
         std::cerr << "Neighbour time (s): " << neighbour_seconds << "\n";
         std::cerr << "BPMDS time (s):   " << solve_seconds << "\n";
         std::cerr << "Move time (s):    " << move_seconds << "\n";
+        std::cerr << "Move passes:      " << move_passes << "\n";
         std::cerr << "Move 1 applied:   " << move1_applied << "\n";
         std::cerr << "Move 8 applied:   " << move8_applied << "\n";
+        std::cerr << "Move 9 applied:   " << move9_applied << "\n";
         std::cerr << "Total time (s):   " << total_seconds << "\n";
         std::cerr << "Exact cost:       " << exact_cost << "\n";
         std::cerr << "Rounded cost:     " << reported_cost << "\n";
