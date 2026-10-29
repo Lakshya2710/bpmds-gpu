@@ -8,7 +8,10 @@ namespace Bucket_Partitioned_MDS
         const double _time_for_solving, 
         const double _maxMB_difference, 
         const double _cost, 
-        const std::vector <std::vector <node_t>>& _routes) 
+        const std::vector <std::vector <node_t>>& _routes,
+        const double _partition,
+        const double _mst,
+        const double _trials) 
     {
         /*
         * Solution: Constructor for creating the object
@@ -21,6 +24,9 @@ namespace Bucket_Partitioned_MDS
         maxMB_difference = _maxMB_difference;
         cost = _cost;
         routes = _routes;
+        partition_seconds = _partition;
+        mst_seconds = _mst;
+        trials_seconds = _trials;
     }
 
     bool Solution::verify(

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -454,6 +455,7 @@ namespace Bucket_Partitioned_MDS
     {
         const auto started = std::chrono::steady_clock::now();
 
+        const auto parse_started = std::chrono::steady_clock::now();
         const VrpInstance original = read_vrp(request.vrp_in);
         const int original_count = static_cast<int>(original.nodes.size());
         const std::vector<std::vector<node_t>> original_routes = read_solution(request.sol_in, original_count);
@@ -461,6 +463,7 @@ namespace Bucket_Partitioned_MDS
         std::vector<int> deleted;
         std::vector<AddEvent> added;
         read_events(request.events_in, original_count, deleted, added);
+        const double parse_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - parse_started).count();
 
         const auto events_started = std::chrono::steady_clock::now();
         VrpInstance updated;
@@ -501,29 +504,10 @@ namespace Bucket_Partitioned_MDS
             }
         }
 
-        std::vector<double> survivor_x;
-        std::vector<double> survivor_y;
-        std::vector<double> query_x;
-        std::vector<double> query_y;
-        survivor_x.reserve(survivors.size());
-        survivor_y.reserve(survivors.size());
-        query_x.reserve(new_customers.size());
-        query_y.reserve(new_customers.size());
-        for (int id : survivors)
-        {
-            survivor_x.push_back(updated.nodes[id].x);
-            survivor_y.push_back(updated.nodes[id].y);
-        }
-        for (int id : new_customers)
-        {
-            query_x.push_back(updated.nodes[id].x);
-            query_y.push_back(updated.nodes[id].y);
-        }
-
         const auto neighbours_started = std::chrono::steady_clock::now();
         std::vector<int> neighbour_ids;
         Gpu::nearest_surviving_customers(
-            survivor_x, survivor_y, survivors, query_x, query_y, kPoolNeighbours, neighbour_ids);
+            updated.nodes, survivors, new_customers, kPoolNeighbours, neighbour_ids);
         const double neighbour_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - neighbours_started).count();
 
@@ -583,8 +567,13 @@ namespace Bucket_Partitioned_MDS
 
         std::vector<std::vector<node_t>> final_routes = std::move(kept_routes);
         double solve_seconds = 0.0;
+        double partition_seconds = 0.0;
+        double mst_seconds = 0.0;
+        double trials_seconds = 0.0;
+        long long bpmds_cost = 0;
         double move_seconds = 0.0;
         int move1_applied = 0;
+        int move2_applied = 0;
         int move8_applied = 0;
         int move9_applied = 0;
         int move_passes = 0;
@@ -595,6 +584,9 @@ namespace Bucket_Partitioned_MDS
             const Solver solver(request.alpha, request.rho);
             const Solution pool_solution = solver.solve(pool);
             solve_seconds = pool_solution.solving_time();
+            partition_seconds = pool_solution.partition_time();
+            mst_seconds = pool_solution.mst_time();
+            trials_seconds = pool_solution.trials_time();
 
             std::vector<std::vector<int>> pool_routes;
             for (const std::vector<node_t>& local_route : pool_solution.get_routes())
@@ -608,12 +600,24 @@ namespace Bucket_Partitioned_MDS
                 pool_routes.push_back(std::move(real_route));
             }
 
+            // Calculate intermediate cost after BPMDS rebuild (before inter-route moves)
+            {
+                std::vector<std::vector<node_t>> pre_move_routes = kept_routes;
+                for (const auto& r : pool_routes)
+                {
+                    pre_move_routes.push_back(r);
+                }
+                const CVRP pre_full(updated.capacity, updated.nodes);
+                bpmds_cost = rounded_solution_cost(pre_full, pre_move_routes);
+            }
+
             if (!pool_routes.empty())
             {
                 Gpu::InterRouteStats move_stats;
                 Gpu::improve_pool_routes(pool_routes, updated.nodes, updated.capacity, move_stats);
                 move_seconds = move_stats.seconds;
                 move1_applied = move_stats.move1;
+                move2_applied = move_stats.move2;
                 move8_applied = move_stats.move8;
                 move9_applied = move_stats.move9;
                 move_passes = move_stats.passes;
@@ -631,18 +635,29 @@ namespace Bucket_Partitioned_MDS
             exact_cost += route_cost(full, route);
         }
 
+        const auto verify_started = std::chrono::steady_clock::now();
         Solution stitched(solve_seconds, 0.0, exact_cost, final_routes);
         if (!stitched.verify(full))
         {
             HANDLE_ERROR("Stitched solution failed verification", true);
         }
+        const double verify_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - verify_started).count();
 
         const long long reported_cost = rounded_solution_cost(full, final_routes);
+
+        const auto export_started = std::chrono::steady_clock::now();
         write_solution(request.sol_out, final_routes, reported_cost);
         write_vrp(request.vrp_out, updated, static_cast<int>(added.size()), static_cast<int>(deleted.size()));
+        const double export_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - export_started).count();
 
         const int routes_kept = static_cast<int>(routes.size()) - rebuilt_route_count;
+        const double core_seconds = event_seconds + neighbour_seconds + solve_seconds + move_seconds;
         const double total_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        const double peak_rss = get_peak_rss_mb();
+        const long long saved_cost = (bpmds_cost > 0) ? (bpmds_cost - reported_cost) : 0;
+        const double saved_pct = (bpmds_cost > 0) ? (100.0 * saved_cost / bpmds_cost) : 0.0;
+        const int total_moves = move1_applied + move2_applied + move8_applied + move9_applied;
+
         std::cerr << std::fixed;
         std::cerr.precision(4);
         std::cerr << "Customers in:     " << (original_count - 1) << "\n";
@@ -656,13 +671,71 @@ namespace Bucket_Partitioned_MDS
         std::cerr << "Event time (s):   " << event_seconds << "\n";
         std::cerr << "Neighbour time (s): " << neighbour_seconds << "\n";
         std::cerr << "BPMDS time (s):   " << solve_seconds << "\n";
+        std::cerr << "  - Partition (s): " << partition_seconds << "\n";
+        std::cerr << "  - Boruvka MST (s): " << mst_seconds << "\n";
+        std::cerr << "  - DFS Trials (s): " << trials_seconds << "\n";
         std::cerr << "Move time (s):    " << move_seconds << "\n";
+        std::cerr << "Core algo time (s): " << core_seconds << "\n";
         std::cerr << "Move passes:      " << move_passes << "\n";
         std::cerr << "Move 1 applied:   " << move1_applied << "\n";
+        std::cerr << "Move 2 applied:   " << move2_applied << "\n";
         std::cerr << "Move 8 applied:   " << move8_applied << "\n";
         std::cerr << "Move 9 applied:   " << move9_applied << "\n";
+        std::cerr << "Total moves:      " << total_moves << "\n";
+        std::cerr << "BPMDS cost:       " << bpmds_cost << "\n";
+        std::cerr << "Final cost:       " << reported_cost << "\n";
+        std::cerr << "Moves reduction:  " << saved_cost << " (" << std::setprecision(2) << saved_pct << "%)\n";
+        std::cerr.precision(4);
+        std::cerr << "File parse (s):   " << parse_seconds << "\n";
+        std::cerr << "Verify time (s):  " << verify_seconds << " [PASSED]\n";
+        std::cerr << "Export time (s):  " << export_seconds << "\n";
         std::cerr << "Total time (s):   " << total_seconds << "\n";
+        std::cerr << "Peak RSS (MB):    " << peak_rss << "\n";
         std::cerr << "Exact cost:       " << exact_cost << "\n";
         std::cerr << "Rounded cost:     " << reported_cost << "\n";
+
+        std::cerr << "\n"
+            << "======================================================================\n"
+            << "                     DYNAMIC BP-MDS SOLVER SUMMARY                    \n"
+            << "======================================================================\n"
+            << "Problem & Event Scale:\n"
+            << "  Customers In / Out:       " << (original_count - 1) << " -> " << (updated_count - 1) << "\n"
+            << "  Events:                   +" << added.size() << " added, -" << deleted.size() << " deleted\n"
+            << "  Routes:                   " << routes_kept << " kept, " << rebuilt_route_count << " rebuilt -> " << final_routes.size() << " total\n"
+            << "  Pool Customers:           " << pool_customers << " (" << std::setprecision(2) << (100.0 * pool_customers / (updated_count - 1)) << "% of total)\n\n"
+            << "Solution Cost Progression:\n"
+            << "  Cost After BPMDS Rebuild: " << bpmds_cost << "\n"
+            << "  Final Cost (Post Moves):  " << reported_cost << "\n"
+            << "  Inter-Route Reduction:    -" << saved_cost << " (-" << std::setprecision(2) << saved_pct << "%)\n"
+            << "  Verification Status:      PASSED (Zero capacity/coverage violations)\n\n"
+            << "Inter-Route Move Yields (" << move_passes << " passes):\n"
+            << "  Move 1 (Relocate-1):      " << move1_applied << "\n"
+            << "  Move 2 (Relocate-2):      " << move2_applied << "\n"
+            << "  Move 8 (2-Opt* Standard): " << move8_applied << "\n"
+            << "  Move 9 (2-Opt* Cross):    " << move9_applied << "\n"
+            << "  Total Moves Applied:      " << total_moves << "\n\n"
+            << "Phase Timing Breakdown:\n"
+            << std::setprecision(4)
+            << "  1. Event Processing:      " << std::setw(8) << event_seconds << " s  (" << std::setw(5) << std::setprecision(1) << (core_seconds > 0 ? (100.0 * event_seconds / core_seconds) : 0.0) << "%)\n"
+            << std::setprecision(4)
+            << "  2. Pool Selection (NN):   " << std::setw(8) << neighbour_seconds << " s  (" << std::setw(5) << std::setprecision(1) << (core_seconds > 0 ? (100.0 * neighbour_seconds / core_seconds) : 0.0) << "%)\n"
+            << std::setprecision(4)
+            << "  3. BPMDS Pool Solver:     " << std::setw(8) << solve_seconds << " s  (" << std::setw(5) << std::setprecision(1) << (core_seconds > 0 ? (100.0 * solve_seconds / core_seconds) : 0.0) << "%)\n"
+            << "     - Partitioning:        " << std::setw(8) << partition_seconds << " s\n"
+            << "     - Boruvka MST:         " << std::setw(8) << mst_seconds << " s\n"
+            << "     - DFS Trials & 2-Opt:  " << std::setw(8) << trials_seconds << " s\n"
+            << std::setprecision(4)
+            << "  4. Inter-Route Moves:     " << std::setw(8) << move_seconds << " s  (" << std::setw(5) << std::setprecision(1) << (core_seconds > 0 ? (100.0 * move_seconds / core_seconds) : 0.0) << "%)\n"
+            << "  --------------------------------------------------\n"
+            << std::setprecision(4)
+            << "  CORE ALGORITHMIC TIME:    " << std::setw(8) << core_seconds << " s  (100.0%)\n\n"
+            << "System & I/O Overhead:\n"
+            << "  - File Parsing:           " << std::setw(8) << parse_seconds << " s\n"
+            << "  - Solution Verification:  " << std::setw(8) << verify_seconds << " s\n"
+            << "  - Solution & VRP Export:  " << std::setw(8) << export_seconds << " s\n"
+            << "  --------------------------------------------------\n"
+            << "  TOTAL WALL-CLOCK PIPELINE:" << std::setw(8) << total_seconds << " s\n"
+            << "  PEAK MEMORY (RSS):        " << std::setw(8) << std::setprecision(1) << peak_rss << " MB\n"
+            << "======================================================================\n";
     }
 }

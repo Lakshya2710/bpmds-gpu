@@ -182,6 +182,28 @@ namespace Gpu
             const int ru = route_of[i];
             const double load_u = route_load[ru];
             const double dem_i = demand[i];
+            const int prev = pred[i];
+            const int next = succ[i];
+
+            double px, py, nx, ny, ix, iy;
+            point_of(prev, x, y, depot_x, depot_y, px, py);
+            point_of(next, x, y, depot_x, depot_y, nx, ny);
+            point_of(i, x, y, depot_x, depot_y, ix, iy);
+
+            const double remove1 = euc(px, py, nx, ny) - euc(px, py, ix, iy) - euc(ix, iy, nx, ny);
+
+            // Precompute Move 2 removal terms if node i has a successor
+            double remove2 = 0.0;
+            double dem_pair = 0.0;
+            if (next >= 0)
+            {
+                const int next2 = succ[next];
+                double n2x, n2y;
+                point_of(next2, x, y, depot_x, depot_y, n2x, n2y);
+                dem_pair = dem_i + demand[next];
+                remove2 = euc(px, py, n2x, n2y) - euc(px, py, ix, iy) - euc(nx, ny, n2x, n2y);
+            }
+
             double best = 0.0;
             int type = 0;
             int arg = -1;
@@ -200,25 +222,34 @@ namespace Gpu
                     continue;
                 }
 
-                const int prev = pred[i];
-                const int next = succ[i];
                 const int after = succ[j];
-                double px, py, nx, ny, ix, iy, jx, jy, ax, ay;
-                point_of(prev, x, y, depot_x, depot_y, px, py);
-                point_of(next, x, y, depot_x, depot_y, nx, ny);
-                point_of(i, x, y, depot_x, depot_y, ix, iy);
+                double jx, jy, ax, ay;
                 point_of(j, x, y, depot_x, depot_y, jx, jy);
                 point_of(after, x, y, depot_x, depot_y, ax, ay);
 
-                const double remove = euc(px, py, nx, ny) - euc(px, py, ix, iy) - euc(ix, iy, nx, ny);
+                // Move 1: single relocate
                 const double insert = euc(jx, jy, ix, iy) + euc(ix, iy, ax, ay) - euc(jx, jy, ax, ay);
-                const double relocate = remove + insert;
+                const double relocate = remove1 + insert;
                 if (route_load[rv] + dem_i <= capacity && relocate < best - kImproveEps)
                 {
                     best = relocate;
                     type = 1;
                     arg = j;
                     route_v = rv;
+                }
+
+                // Move 2: relocate pair (i, next)
+                if (next >= 0 && route_load[rv] + dem_pair <= capacity)
+                {
+                    const double insert2 = euc(jx, jy, ix, iy) + euc(nx, ny, ax, ay) - euc(jx, jy, ax, ay);
+                    const double relocate2 = remove2 + insert2;
+                    if (relocate2 < best - kImproveEps)
+                    {
+                        best = relocate2;
+                        type = 2;
+                        arg = j;
+                        route_v = rv;
+                    }
                 }
 
                 const double link = euc(ix, iy, jx, jy) + euc(nx, ny, ax, ay)
@@ -250,7 +281,7 @@ namespace Gpu
                     double dx, dy;
                     point_of(-1, x, y, depot_x, depot_y, dx, dy);
                     const double insert_front = euc(dx, dy, ix, iy) + euc(ix, iy, jx, jy) - euc(dx, dy, jx, jy);
-                    const double relocate_front = remove + insert_front;
+                    const double relocate_front = remove1 + insert_front;
                     if (route_load[rv] + dem_i <= capacity && relocate_front < best - kImproveEps)
                     {
                         best = relocate_front;
@@ -258,6 +289,21 @@ namespace Gpu
                         arg = -1;
                         route_v = rv;
                     }
+
+                    // Move 2 front insertion
+                    if (next >= 0 && route_load[rv] + dem_pair <= capacity)
+                    {
+                        const double insert2_front = euc(dx, dy, ix, iy) + euc(nx, ny, jx, jy) - euc(dx, dy, jx, jy);
+                        const double relocate2_front = remove2 + insert2_front;
+                        if (relocate2_front < best - kImproveEps)
+                        {
+                            best = relocate2_front;
+                            type = 2;
+                            arg = -1;
+                            route_v = rv;
+                        }
+                    }
+
                     const double link_depot = euc(ix, iy, dx, dy) + euc(nx, ny, jx, jy)
                                             - euc(ix, iy, nx, ny) - euc(dx, dy, jx, jy);
                     const double depot_a = cum_load[i];
@@ -270,6 +316,7 @@ namespace Gpu
                         arg = -1;
                         route_v = rv;
                     }
+
                     const double link_depot9 = euc(ix, iy, jx, jy) + euc(dx, dy, nx, ny)
                                              - euc(ix, iy, nx, ny) - euc(dx, dy, jx, jy);
                     const double depot9_a = cum_load[i] + route_load[rv];
@@ -316,6 +363,29 @@ namespace Gpu
             else
             {
                 route_v.insert(route_v.begin() + pos_v + 1, customer);
+            }
+        }
+
+        void apply_move2(
+            std::vector<int>& route_u,
+            std::vector<int>& route_v,
+            int pos_u,
+            int pos_v)
+        {
+            if (pos_u < 0 || pos_u + 1 >= static_cast<int>(route_u.size()))
+            {
+                return;
+            }
+            const int cust1 = route_u[pos_u];
+            const int cust2 = route_u[pos_u + 1];
+            route_u.erase(route_u.begin() + pos_u, route_u.begin() + pos_u + 2);
+            if (pos_v < 0)
+            {
+                route_v.insert(route_v.begin(), {cust1, cust2});
+            }
+            else
+            {
+                route_v.insert(route_v.begin() + pos_v + 1, {cust1, cust2});
             }
         }
 
@@ -384,6 +454,7 @@ namespace Gpu
     {
         const auto started = std::chrono::steady_clock::now();
         stats.move1 = 0;
+        stats.move2 = 0;
         stats.move8 = 0;
         stats.move9 = 0;
         stats.passes = 0;
@@ -613,6 +684,12 @@ namespace Gpu
                     rep_v = routes[move.route_v];
                     apply_move1(rep_u, rep_v, pos_u, pos_v);
                 }
+                else if (move.type == 2)
+                {
+                    rep_u = routes[move.route_u];
+                    rep_v = routes[move.route_v];
+                    apply_move2(rep_u, rep_v, pos_u, pos_v);
+                }
                 else if (move.type == 8)
                 {
                     apply_move8(routes[move.route_u], routes[move.route_v], pos_u, pos_v, rep_u, rep_v);
@@ -637,6 +714,7 @@ namespace Gpu
                 }
 
                 if (move.type == 1) ++stats.move1;
+                else if (move.type == 2) ++stats.move2;
                 else if (move.type == 8) ++stats.move8;
                 else if (move.type == 9) ++stats.move9;
                 ++applied_moves;

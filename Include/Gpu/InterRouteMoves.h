@@ -10,6 +10,7 @@ namespace Gpu
     {
         double seconds = 0.0;
         int move1 = 0;
+        int move2 = 0;
         int move8 = 0;
         int move9 = 0;
         int passes = 0;

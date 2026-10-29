@@ -1,4 +1,5 @@
 #include "Dynamic.h"
+#include "Gpu/NearestKernels.h"
 
 #include <iostream>
 #include <string>
@@ -16,6 +17,8 @@ namespace
 
 int main(int argc, char* argv[])
 {
+    Gpu::gpu_warmup();
+
     double alpha = 0.0;
     int rho = 0;
     bool have_alpha = false;

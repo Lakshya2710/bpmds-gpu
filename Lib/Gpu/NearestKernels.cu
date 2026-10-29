@@ -157,17 +157,20 @@ namespace Gpu
         }
     }
 
+    void gpu_warmup()
+    {
+        cudaFree(0);
+    }
+
     void nearest_surviving_customers(
-        const std::vector<double>& survivor_x,
-        const std::vector<double>& survivor_y,
-        const std::vector<int>&    survivor_ids,
-        const std::vector<double>& query_x,
-        const std::vector<double>& query_y,
-        int                        k,
-        std::vector<int>&          neighbour_ids)
+        const std::vector<Point>& nodes,
+        const std::vector<int>&   survivor_ids,
+        const std::vector<int>&   query_ids,
+        int                       k,
+        std::vector<int>&         neighbour_ids)
     {
         const int n_survivors = static_cast<int>(survivor_ids.size());
-        const int n_queries   = static_cast<int>(query_x.size());
+        const int n_queries   = static_cast<int>(query_ids.size());
         neighbour_ids.assign(static_cast<size_t>(n_queries) * static_cast<size_t>(k), -1);
 
         if (n_queries == 0 || n_survivors == 0 || k <= 0)
@@ -181,7 +184,7 @@ namespace Gpu
 
         const int num_tiles = (n_survivors + kTileSize - 1) / kTileSize;
 
-        // Precompute tile bounding boxes and pack survivor coordinates into float2
+        // Precompute tile bounding boxes and pack survivor coordinates directly from nodes
         std::vector<float2> survivor_coords(n_survivors);
         std::vector<float4> tile_boxes(num_tiles);
 
@@ -194,8 +197,9 @@ namespace Gpu
 
             for (int i = start; i < end; ++i)
             {
-                const float x = static_cast<float>(survivor_x[i]);
-                const float y = static_cast<float>(survivor_y[i]);
+                const int sid = survivor_ids[i];
+                const float x = static_cast<float>(nodes[sid].x);
+                const float y = static_cast<float>(nodes[sid].y);
                 survivor_coords[i] = make_float2(x, y);
 
                 if (x < min_x) min_x = x;
@@ -206,13 +210,14 @@ namespace Gpu
             tile_boxes[t] = make_float4(min_x, max_x, min_y, max_y);
         }
 
-        // Pack query coordinates into float2
+        // Pack query coordinates directly from nodes
         std::vector<float2> query_coords(n_queries);
         for (int i = 0; i < n_queries; ++i)
         {
+            const int qid = query_ids[i];
             query_coords[i] = make_float2(
-                static_cast<float>(query_x[i]),
-                static_cast<float>(query_y[i]));
+                static_cast<float>(nodes[qid].x),
+                static_cast<float>(nodes[qid].y));
         }
 
         // Single contiguous device allocation (cuts down 6 separate cudaMalloc calls)

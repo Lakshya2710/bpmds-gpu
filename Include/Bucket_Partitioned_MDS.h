@@ -48,6 +48,9 @@ namespace Bucket_Partitioned_MDS
         double maxMB_difference;
         double cost;
         std::vector <std::vector <node_t>> routes;
+        double partition_seconds;
+        double mst_seconds;
+        double trials_seconds;
 
         distance_t get_total_cost_of_routes(
             const CVRP& cvrp);
@@ -56,13 +59,19 @@ namespace Bucket_Partitioned_MDS
             const double, 
             const double, 
             const double,
-            const std::vector <std::vector <node_t>>&);
+            const std::vector <std::vector <node_t>>&,
+            const double partition = 0.0,
+            const double mst = 0.0,
+            const double trials = 0.0);
         bool verify(
             const CVRP&) const;
         void print(
             std::ostream&) const;
         const std::vector<std::vector<node_t>>& get_routes() const;
         double solving_time() const;
+        double partition_time() const { return partition_seconds; }
+        double mst_time() const { return mst_seconds; }
+        double trials_time() const { return trials_seconds; }
     };
 
     class Solver 

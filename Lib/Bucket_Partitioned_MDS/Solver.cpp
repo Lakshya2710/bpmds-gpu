@@ -43,21 +43,21 @@ namespace Bucket_Partitioned_MDS
         Gpu::SolverContext gpu_ctx(cvrp, alpha);
         gpu_ctx.partition();
         const int num_buckets = gpu_ctx.num_buckets();
-	
-	auto end1 = std::chrono::high_resolution_clock::now();
-	std::cout<<"HERE1: "<<std::chrono::duration<double>(end1 - start).count()<<std::endl;
+
+        auto end1 = std::chrono::high_resolution_clock::now();
+        const double partition_time = std::chrono::duration<double>(end1 - start).count();
 
         gpu_ctx.build_all_msts_streamed();
-	
-	auto end2 = std::chrono::high_resolution_clock::now();
-        std::cout<<"HERE2: "<<std::chrono::duration<double>(end2 - start).count()<<std::endl;
+
+        auto end2 = std::chrono::high_resolution_clock::now();
+        const double mst_time = std::chrono::duration<double>(end2 - end1).count();
 
         gpu_ctx.run_all_route_trials_streamed(rho);
-	
-	auto end3 = std::chrono::high_resolution_clock::now();
-        std::cout<<"HERE3: "<<std::chrono::duration<double>(end3 - start).count()<<std::endl;
 
-	for (int bucket_id = 0; bucket_id < num_buckets; ++bucket_id)
+        auto end3 = std::chrono::high_resolution_clock::now();
+        const double trials_time = std::chrono::duration<double>(end3 - end2).count();
+
+        for (int bucket_id = 0; bucket_id < num_buckets; ++bucket_id)
         {
             std::vector<std::vector<node_t>> low_cost_routes;
             distance_t pre_opt_cost = DBL_MAX;
@@ -82,6 +82,6 @@ namespace Bucket_Partitioned_MDS
         double execution_time = std::chrono::duration<double>(end - start).count();
         double maxMB_difference = maxMB_after_execution - maxMB_before_execution;
 
-        return Solution(execution_time, maxMB_difference, final_cost, final_routes);
+        return Solution(execution_time, maxMB_difference, final_cost, final_routes, partition_time, mst_time, trials_time);
     }
 }
